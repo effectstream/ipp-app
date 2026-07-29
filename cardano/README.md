@@ -1,91 +1,89 @@
-# Cardano Stake Pool Delegation Explorer
+# IPP Cardano anchor devnet
 
-Demonstrates the `PrimitiveTypeCardanoPoolDelegation` primitive — a Cardano-only template that indexes stake pool delegation certificates and displays them in a real-time dashboard.
+A local Cardano devnet plus a sync node that turns IPP's on-chain anchors into a
+queryable table. Built on the **EffectStream** packages and
+adapted from the `cardano-delegation` template - **no smart contract, no Docker**
+(yaci-devkit and Dolos run as native binaries).
 
-## Quick Start
+The backend's `CardanoAdapter`
+([../backend/src/adapters/cardano.ts](../backend/src/adapters/cardano.ts))
+submits anchors here; this workspace indexes them back into `ipp_anchors`, which
+the backend reads for verification.
+
+## Quick start
 
 ```bash
+cd cardano
+./link.sh            # one-time: symlink the local @effectstream packages
 bun install
-bun run dev
+bun run dev          # orchestrator: pglite + yaci + Dolos + sync node
 ```
 
-## Link against local packages
-```
-./link.sh
-```
+Then point the backend at it: set `CHAIN=cardano` in `backend/.env` and restart.
 
-
-Open [http://localhost:10599](http://localhost:10599)
-
-## Architecture
+## How it works
 
 ```
-Browser (Lucid Evolution)
-  │ .registerAndDelegate.ToPool(rewardAddress, poolId)
+backend CardanoAdapter (Lucid Evolution)
+  │ pay.ToAddress(self, 2 ADA).attachMetadata(8327, { t, k, v })
   ▼
-YACI DevKit (:10000) → Dolos UTxORPC (:50051)
-  ▼
-PrimitiveTypeCardanoPoolDelegation
-  │ { address, pool, epoch }
-  ▼
-State Machine → delegations table
-  ▼
-API (GET /api/delegations, GET /api/pool-stats)
-  ▼
-React Dashboard (polls every 2s)
+YACI DevKit (:10000 admin / :3001 node)  ──submit──▶  Cardano devnet
+  ▼ block produced
+Dolos  (:50051 UTxO-RPC · :3000 mini-Blockfrost)
+  ▼ streamed to
+sync node: CardanoTransfer primitive → state machine
+  │ keep only label 8327 { t:"ipp"|"ipp-study", k, v }
+  ▼ INSERT
+ipp_anchors  (pglite, :5432)
+  ▲ read by
+backend CardanoAdapter.read(key)  →  GET /api/v1/verify · /onchain
 ```
 
-Wallets are 100% browser-managed via Lucid Evolution. All state changes happen through blockchain transactions — the node API is read-only.
+All state changes happen through blockchain transactions; the sync node and its
+read API are read-only. The metadata payload is `{ t, k, v }` where `k =
+SHA-256(rut)` (or a study id) and `v = SHA-256(canonical record)` (or a study
+Merkle root) - hashes only, never patient data.
 
-## Services
+## Services & ports
 
-| Service | Port | Description |
-|---------|------|-------------|
-| YACI DevKit | 10000 | Cardano devnet |
-| Dolos gRPC | 50051 | UTxO-RPC sync |
-| Dolos MiniBF | 3000 | Blockfrost-compatible API |
-| Sync Node API | 9999 | Indexed data (GET only) |
-| Frontend | 10599 | React dashboard |
-| PGLite | embedded | PostgreSQL (in-process) |
+| Service              | Port  | Description                              |
+|----------------------|-------|------------------------------------------|
+| YACI DevKit (admin)  | 10000 | Cardano devnet admin API (tx submit, faucet) |
+| Cardano node         | 3001  | Devnet node                              |
+| Dolos UTxO-RPC       | 50051 | Chain sync stream the primitive consumes |
+| Dolos mini-Blockfrost| 3000  | Blockfrost-compatible read API (`CARDANO_DOLOS_URL`) |
+| pglite               | 5432  | In-process Postgres holding `ipp_anchors` |
+| EffectStream API     | 4747  | Orchestrator API (`/api/anchors`)        |
+| Sync node            | 9999  | Internal sync HTTP server                |
 
-## Project Structure
+## Project structure
 
 ```
 packages/
-├── contracts-cardano/    @cardano-delegation/contracts-cardano
-├── database/             @cardano-delegation/database
-├── node/                 @cardano-delegation/node
-├── frontend/             @cardano-delegation/frontend
-└── tests/                @cardano-delegation/tests
+├── node/                 # the IPP sync node
+│   ├── grammar.ts         # cardano-transfer grammar
+│   ├── config.dev.ts      # NTP + Cardano UTxO-RPC + CardanoTransfer primitive
+│   ├── state-machine.ts   # filter label 8327 → INSERT into ipp_anchors
+│   ├── api.ts             # read API over ipp_anchors (/api/anchors/:key)
+│   └── main.dev.ts        # entry point
+├── database/
+│   └── migrations/000-init.sql   # ipp_anchors table
+└── contracts-cardano/     # yaci-devkit + Dolos config (+ Lucid tx helpers)
+    └── temp/alonzo-genesis2.json # required by Dolos (see gotcha below)
+start.dev.ts               # orchestrator config (pglite + cardano + sync)
 ```
 
-### Node (`packages/node/`)
+## Gotcha
 
-| File | Description |
-|------|-------------|
-| `grammar.ts` | `cardanoPoolDelegation` built-in grammar |
-| `config.dev.ts` | NTP + Cardano UTXORPC + PoolDelegation primitive |
-| `state-machine.ts` | Indexes delegation events into `delegations` table |
-| `api.ts` | GET endpoints for delegations and pool stats |
-| `main.dev.ts` | Entry point |
+Dolos needs `packages/contracts-cardano/temp/alonzo-genesis2.json` to bootstrap;
+it is force-kept in `.gitignore` (the rest of `temp/` is ignored). If Dolos
+fails to start with a genesis error, confirm that file is present.
 
-### API Endpoints
+## Notes
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/delegations` | All delegations (limit/offset) |
-| GET | `/api/delegations/:pool` | Filter by pool hash |
-| GET | `/api/pool-stats` | Pool statistics |
-| GET | `/api/block-heights` | Sync protocol status |
-
-## Testing
-
-```bash
-bun run test
-```
-
-Runs three phases:
-- **Phase A**: Infrastructure (YACI, Dolos health checks)
-- **Phase B**: State machine (DB schema verification)
-- **Phase C**: Playwright E2E (create wallet, fund, delegate, verify indexed data)
-
+- Each devnet boot starts from genesis, so `ipp_anchors` begins empty and
+  re-indexes as anchors are submitted.
+- The default backend wallet is generated and faucet-funded on first anchor; set
+  `CARDANO_WALLET_SEED` in `backend/.env` to pin a wallet.
+- For a real network, point `CARDANO_*` at Blockfrost (preprod/mainnet) instead
+  of the local Dolos/Yaci endpoints.
