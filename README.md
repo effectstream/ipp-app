@@ -4,7 +4,7 @@ IPP is a location-based, on-chain-verifiable clinical-records app for Chilean
 doctors and medical staff (Spanish UI). It is built as a **prototype /
 demonstrator** of a reusable template - GPS + location-based AR capture on iOS,
 backed by a Bun service on Neon Postgres, with each record's hash anchored to
-**Cardano** (through the **EffectStream / Paima Engine** packages) so the data
+**Cardano** (through the **EffectStream** packages) so the data
 can be cryptographically verified later.
 
 The app pairs **GPS** (where each patient lives) with **location-based AR**
@@ -80,8 +80,7 @@ size the radius of affectation, and act locally.
 │   └── Views/                    # Home, DynamicForm (StatCaption), Leaderboard, WebDashboard, Theme
 ├── web/src/                      # Vite + React dashboard
 │   └── components/               # MapView, MapFilters, AnnotationsLayer, DrawingController, Feedback, PinVerify
-├── cardano/                      # EffectStream (Paima Engine) workspace - local Cardano devnet + sync
-└── BLOG.md                       # community write-up
+└── cardano/                      # EffectStream workspace - local Cardano devnet + sync
 ```
 
 ## How it's integrated
@@ -97,7 +96,7 @@ size the radius of affectation, and act locally.
   ([web/src/components/MapFilters.tsx](web/src/components/MapFilters.tsx)) so a
   study is built on medical stats, never on names.
 
-### Augmented data - at capture
+### Location-based AR - at capture
 
 `GET /api/v1/field-stats` aggregates each field across three scopes by haversine
 distance from the patient (local / país / mundo); the iOS form renders them as a
@@ -106,18 +105,18 @@ discreet line under the input (`StatCaption` in
 averages for numbers, % "sí" for booleans, the selected option's share for
 pickers.
 
-### Augmented data - on the map
+### Location-based AR - on the map
 
 Over the filtered population layer, doctors place **notes** and draw **named
 areas** ([AnnotationsLayer](web/src/components/AnnotationsLayer.tsx),
 [DrawingController](web/src/components/DrawingController.tsx),
 [AnnotationsList](web/src/components/AnnotationsList.tsx)) to mark interventions -
 the manual planning layer that turns a cluster into "assign a specialist here."
-(Again: augmented *data*, not a camera overlay.)
+(Again: location-based AR anchored through GPS, not a camera overlay.)
 
 ### Engine
 
-The chain sync runs on the **EffectStream (Paima Engine)** packages: a primitive
+The chain sync runs on the **EffectStream** packages: a primitive
 streams Cardano transaction metadata and projects it into an `ipp_anchors` table
 the backend reads as ordinary app state. (See [Cardano anchor](#cardano-anchor).)
 
@@ -151,7 +150,7 @@ shown in the app, tying the contributor to an on-chain identity.
 ## Cardano anchor
 
 The [`cardano/`](cardano/) workspace runs a local Cardano devnet on the
-EffectStream (Paima Engine) packages - yaci-devkit + Dolos + a sync node, no
+EffectStream packages - yaci-devkit + Dolos + a sync node, no
 smart contract, no Docker. The backend's `CardanoAdapter`
 ([backend/src/adapters/cardano.ts](backend/src/adapters/cardano.ts)) anchors each
 hash in **Cardano transaction metadata** (label `8327`) with Lucid, submitting
@@ -302,7 +301,7 @@ Schema is created on startup (idempotent `CREATE TABLE IF NOT EXISTS`).
 
 ```bash
 cd cardano
-bun install                 # one-time (links the EffectStream / Paima packages)
+bun install                 # one-time (links the EffectStream packages)
 bun run dev                 # yaci-devkit + Dolos + pglite + sync node (no Docker)
 ```
 
@@ -344,13 +343,14 @@ deterministically from the account seed, sending `X-IPP-PubKey` /
 
 ## Demo - video & screenshots
 
-> A screen recording of the end-to-end flow (capture → augmented stats → save →
+> A screen recording of the end-to-end flow (capture → location-based AR stats → save →
 > on-chain verify → population map → gamified leaderboard) and screenshots will
-> be added here / in [BLOG.md](BLOG.md).
+> be added here / in the [EffectStream blog post](https://effectstream.github.io/docs/blog/ipp-clinical-records-cardano).
 
 ## Community write-up
 
-[BLOG.md](BLOG.md) is the long-form write-up of the engineering and use-cases.
+The [EffectStream blog post](https://effectstream.github.io/docs/blog/ipp-clinical-records-cardano)
+is the long-form write-up of the engineering and use-cases.
 
 ## Roadmap
 
@@ -362,8 +362,63 @@ deterministically from the account seed, sending `X-IPP-PubKey` /
 
 ## What's intentionally not done
 
-- **AR is augmented *data*, not camera AR.** There is no ARKit/RealityKit
-  overlay; the augmentation is the location-aware stats and map planning layer.
+- **AR is location-based, not camera-based.** There is no ARKit/RealityKit
+  overlay; the augmentation is anchored to place through GPS - the
+  location-aware stats and map planning layer.
 - **Demo accounts ship fixed seeds** - fine for a demo, but a real deployment
   needs per-user generated keys (see Roadmap).
 - **No smart-contract token mint** - the chain layer is metadata anchoring only.
+
+## Developer guide
+
+IPP is a template; here is how to adapt and extend it. (To just run all four
+pieces, see [Running it](#running-it).)
+
+### Edit the form (no app release needed)
+
+The questionnaire is a JSON schema stored in the `form_schema` table (seeded from
+[backend/src/schema-defaults.ts](backend/src/schema-defaults.ts)). Edit it live in
+the web **Configurar** tab (signed `PUT /api/v1/schema`); both clients fetch it on
+next launch, so you can add / remove / reorder / relabel questions with no app
+release. Each question carries `id, label, type, tab, order, options?,
+placeholder?, hidden?, dependsOn?/dependsOnValue?, filterable?` (see
+[ios/IPP/Models/FormSchema.swift](ios/IPP/Models/FormSchema.swift)).
+
+### Add a question type
+
+Extend the `QuestionType` enum and add a renderer row in
+[ios/IPP/Views/DynamicFormView.swift](ios/IPP/Views/DynamicFormView.swift) plus
+the matching web input. Numeric / boolean / picker types already drive the
+location-based AR stat line under each field.
+
+### Swap or add a chain
+
+Implement `submit(ctx)` / `read(keyHex)` (the `ChainAdapter` interface) in
+`backend/src/adapters/<name>.ts`, register it in `pickAdapter`
+([backend/src/server.ts](backend/src/server.ts)), and set `CHAIN=<name>`.
+`local` ([adapters/local.ts](backend/src/adapters/local.ts)) is the no-op default;
+`cardano` ([adapters/cardano.ts](backend/src/adapters/cardano.ts)) anchors in tx
+metadata. To target a real network, point `CARDANO_*` at Blockfrost
+preprod/mainnet + a funded wallet seed instead of the local devnet.
+
+### Keep the canonical hash byte-identical
+
+The anchored value is `SHA-256` of the record's **canonical JSON** (sorted keys,
+passcode excluded). iOS (`PatientHasher`, CryptoKit) and TS
+([backend/src/canonical.ts](backend/src/canonical.ts)) must agree byte-for-byte -
+that parity is what lets the device verify independently of the backend, and it
+is locked by a test vector. If you change the encoding, update **both** encoders
+and re-run [backend/scripts/verify-canonical.ts](backend/scripts/verify-canonical.ts).
+
+### Where state lives
+
+- **Neon** - the mutable source of truth (patients + app tables).
+- **`ipp_anchors`** (cardano pglite) - an immutable read-model synced from chain;
+  the verification path reads here.
+- **Cardano** - the root of trust; every proof reduces to the on-chain hash.
+
+### Adapt to another vertical
+
+Swap the schema (surveys, audits, field inspections) and keep the rest - the GPS
+map + filters, location-based AR stats, gamified contribution, and the
+metadata-anchor + verify pipeline are all schema-agnostic.
