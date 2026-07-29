@@ -2,14 +2,14 @@
 
 IPP is a location-based, on-chain-verifiable clinical-records app for Chilean
 doctors and medical staff (Spanish UI). It is built as a **prototype /
-demonstrator** of a reusable template - GPS + augmented data capture on iOS,
+demonstrator** of a reusable template - GPS + location-based AR capture on iOS,
 backed by a Bun service on Neon Postgres, with each record's hash anchored to
 **Cardano** (through the **EffectStream / Paima Engine** packages) so the data
 can be cryptographically verified later.
 
-The app pairs **GPS** (where each patient lives) with **augmented data** (live
-population context shown as you work) and a **gamified** contribution layer that
-makes the dataset grow.
+The app pairs **GPS** (where each patient lives) with **location-based AR**
+(live population context augmenting what the clinician sees as they work) and a
+**gamified** contribution layer that makes the dataset grow.
 
 ## What this is
 
@@ -22,11 +22,12 @@ makes the dataset grow.
   interface, and the anchor pattern is generic - so the same shape powers any
   "private data, publicly verifiable" location app.
 
-## Why GPS + AR (augmented data)
+## Why GPS + location-based AR
 
 GPS is the backbone: every patient has an address that geocodes to a
-latitude/longitude. That location unlocks **augmented reality for the data** -
-augmenting what the clinician sees, in two places:
+latitude/longitude. That location unlocks **augmented reality anchored to
+place** - augmenting what the clinician sees about the physical world in front
+of them, in two places:
 
 1. **At capture.** As you enter a value, the field shows the population context
    for it - the **local** (the patient's own locality), **país** (country), and
@@ -36,9 +37,10 @@ augmenting what the clinician sees, in two places:
    population layer, turning patterns into plans - e.g. *"many patients in this
    zone need X, assign a specialist and schedule exams here."*
 
-> This is augmentation of the **data and decision**, not a camera/ARKit overlay -
-> the "reality" being augmented is the clinician's view of the population, keyed
-> to where the patient lives.
+> This is **location-based AR**: the augmentation is anchored to physical place
+> through GPS rather than to a camera feed. The reality being augmented is the
+> clinician's view of the patient and population in front of them, keyed to
+> where the patient actually lives.
 
 **Why we prioritized it:** women's-health and pelvic-floor risk cluster
 geographically. Location-aware context at the point of capture (and on the map)
