@@ -78,6 +78,22 @@ import simd
 /// ``Tuning/fastFlick`` also came down 2400 → 2200 pt/s so the ceiling is
 /// actually reachable by a thumb rather than being a number in a file.
 ///
+/// # Steering (Gate 5 → Phase 5B)
+///
+/// The `side` in that formula used to be ARKit's `columns.0`, which is the
+/// right-hand axis of a **landscape** screen. In a portrait-locked app that is
+/// the phone's long axis, so the swipe's horizontal component was pushing the
+/// throw up or down instead of left or right — Gate 5 row 5-g5, "I only see
+/// straight ball launches even with diagonal swipes".
+///
+/// Two changes fix it, and the second makes the first unfalsifiable:
+/// ``CameraBasis/init(transform:orientation:)`` maps the transform onto the
+/// real interface orientation, and ``CameraBasis/sideAxis`` then strips the
+/// vertical part of whatever it gets. Steering is therefore always horizontal,
+/// whatever the phone is doing and wherever the axis came from — the AR side
+/// prefers to measure it through `ARView.ray(through:)`, which owns the
+/// projection and the orientation.
+///
 /// # Scoring (Gate 4 → Phase 5)
 ///
 /// Two tiers, and the second absorbs the first: touching the cup anywhere pays
@@ -287,6 +303,29 @@ struct TossController {
         var upwardTravel: Float { max(-translation.y, 0) }
     }
 
+    /// Which way up the screen is, so an ARKit camera transform can be read as
+    /// *screen* axes (Q4, fixed in Phase 5B).
+    ///
+    /// ARKit expresses `ARCamera.transform` in **landscape-right** orientation
+    /// whatever the device is actually doing: `columns.0` is the direction that
+    /// points to the right of a screen held in landscape-right, which is the
+    /// phone's **long** axis. IPP is portrait-locked, so reading `columns.0` as
+    /// "right" reads a vertical world direction — which is exactly what Gate 5
+    /// row 5-g5 saw: diagonal flicks changed the throw's *height* instead of
+    /// steering it sideways.
+    ///
+    /// Rotating the landscape-right screen frame into each interface
+    /// orientation gives the mapping below (`x` = `columns.0`, `y` =
+    /// `columns.1`).
+    enum ScreenOrientation: Equatable, CaseIterable {
+        /// The only orientation IPP ever runs in — `Info.plist`'s
+        /// `UISupportedInterfaceOrientations` lists portrait and nothing else.
+        case portrait
+        case portraitUpsideDown
+        case landscapeLeft
+        case landscapeRight
+    }
+
     /// The camera's world-space pose, reduced to the three things a throw needs.
     ///
     /// Built from an `ARCamera`'s transform by the AR side; `simd_float4x4` is a
@@ -296,7 +335,8 @@ struct TossController {
         var position: SIMD3<Float>
         /// Unit vector the camera looks along.
         var forward: SIMD3<Float>
-        /// Unit vector out of the camera's right-hand side.
+        /// Unit vector along the direction the player perceives as "right of
+        /// the screen". Not necessarily horizontal — see ``sideAxis``, which is.
         var right: SIMD3<Float>
 
         init(position: SIMD3<Float>, forward: SIMD3<Float>, right: SIMD3<Float>) {
@@ -305,14 +345,64 @@ struct TossController {
             self.right = right
         }
 
-        /// ARKit's camera transform: `+x` right, `+y` up, `+z` **backward**, so
-        /// the viewing direction is the negated third column.
-        init(transform: simd_float4x4) {
+        /// ARKit's camera transform: `+x` right *in landscape-right*, `+y` up
+        /// *in landscape-right*, `+z` **backward**, so the viewing direction is
+        /// the negated third column and the screen's right-hand axis depends on
+        /// the interface orientation (``ScreenOrientation``).
+        ///
+        /// The default is `.portrait` because the app is portrait-locked; the
+        /// other cases exist so the mapping is stated once, testably, instead of
+        /// being an assumption buried in a column index (Q4).
+        init(transform: simd_float4x4, orientation: ScreenOrientation = .portrait) {
+            let landscapeRight = SIMD3(
+                transform.columns.0.x, transform.columns.0.y, transform.columns.0.z
+            )
+            let landscapeUp = SIMD3(
+                transform.columns.1.x, transform.columns.1.y, transform.columns.1.z
+            )
+            let screenRight: SIMD3<Float>
+            switch orientation {
+            case .landscapeRight: screenRight = landscapeRight
+            case .landscapeLeft: screenRight = -landscapeRight
+            case .portrait: screenRight = landscapeUp
+            case .portraitUpsideDown: screenRight = -landscapeUp
+            }
             self.init(
                 position: SIMD3(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z),
                 forward: -SIMD3(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z),
-                right: SIMD3(transform.columns.0.x, transform.columns.0.y, transform.columns.0.z)
+                right: screenRight
             )
+        }
+
+        /// The axis a sideways swipe actually steers along: unit length,
+        /// **orthogonal to gravity**, pointing to the player's right.
+        ///
+        /// Two things are going on, and both are the Q4 fix:
+        ///
+        /// 1. ``right`` is the screen's right-hand axis, which the initialiser
+        ///    above now derives for the real interface orientation instead of
+        ///    assuming landscape.
+        /// 2. Whatever it is, its vertical part is removed. The nudge is a
+        ///    *steering* control — it should change where the throw goes, never
+        ///    how high it goes — so it may not be allowed to borrow from the
+        ///    loft even when the player rolls the phone a few degrees.
+        ///
+        /// Fallbacks, in order: a screen-right that is (near) vertical, which
+        /// only happens with the phone rolled onto its side, falls back to the
+        /// horizontal axis the aim itself defines, `forward × up`; a camera
+        /// basis that is degenerate in both falls back to world `+x`. Neither
+        /// can produce a NaN.
+        var sideAxis: SIMD3<Float> {
+            let flattened = right - TossController.worldUp * simd_dot(right, TossController.worldUp)
+            if simd_length_squared(flattened) > 1e-6 {
+                return TossController.unit(flattened, fallback: TossController.defaultRight)
+            }
+            let aim = TossController.unit(forward, fallback: TossController.defaultForward)
+            let derived = simd_cross(aim, TossController.worldUp)
+            if simd_length_squared(derived) > 1e-6 {
+                return TossController.unit(derived, fallback: TossController.defaultRight)
+            }
+            return TossController.defaultRight
         }
     }
 
@@ -522,10 +612,13 @@ struct TossController {
     /// and steered by the swipe, scaled to ``launchSpeed(for:)``.
     ///
     /// The loft is added along **world** up rather than the camera's up, so the
-    /// arc is the same whether the player holds the phone level or tilted.
+    /// arc is the same whether the player holds the phone level or tilted, and
+    /// the steering is added along ``CameraBasis/sideAxis``, which is horizontal
+    /// — so a diagonal flick veers left or right and never trades that for
+    /// height (Q4, Gate 5 row 5-g5).
     func launchVelocity(for swipe: Swipe, camera: CameraBasis) -> SIMD3<Float> {
         let aim = Self.unit(camera.forward, fallback: Self.defaultForward)
-        let side = Self.unit(camera.right, fallback: Self.defaultRight)
+        let side = camera.sideAxis
         let heading = aim
             + Self.worldUp * tuning.arc
             + side * lateralDeflection(for: swipe)

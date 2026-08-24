@@ -163,7 +163,15 @@ enum PodiumBuilder {
 
         /// Where the trophy stands when it is on this step, in the steps
         /// container's frame: centred on the step's top face.
-        var trophyPosition: SIMD3<Float> { [x, height, 0] }
+        var trophyPosition: SIMD3<Float> { trophyPosition(atHeight: height) }
+
+        /// The same thing for a step that is not at its resting height —
+        /// the podium breathes (FR-012), so the top face the trophy stands on
+        /// moves, and everything that rides the step has to be told where it
+        /// is right now.
+        func trophyPosition(atHeight height: Float) -> SIMD3<Float> {
+            [x, height, 0]
+        }
     }
 
     /// Picks the step the cup jumps to after a make (spec US3: "consecutive
@@ -257,26 +265,51 @@ enum PodiumBuilder {
         return podium
     }
 
-    /// One podium step, resting on y = 0 with its centre at `x`.
-    static func makeStep(name: String, color: UIColor, height: Float, x: Float) -> ModelEntity {
-        let mesh = MeshResource.generateBox(
+    /// The box a step of `height` is drawn as. Split out of ``makeStep`` so the
+    /// breathing ladder (FR-012) can pre-build one per rung.
+    static func stepMesh(height: Float) -> MeshResource {
+        MeshResource.generateBox(
             width: Metrics.stepWidth,
-            height: height,
+            height: max(height, 0.001),
             depth: Metrics.stepDepth,
             cornerRadius: 0.004
         )
-        let step = ModelEntity(mesh: mesh, materials: [material(color)])
+    }
+
+    /// The collision shape that goes with ``stepMesh(height:)``. The two are
+    /// always swapped together, which is what keeps a breathing step's collider
+    /// exactly where its faces are.
+    static func stepShape(height: Float) -> ShapeResource {
+        .generateBox(
+            width: Metrics.stepWidth,
+            height: max(height, 0.001),
+            depth: Metrics.stepDepth
+        )
+    }
+
+    /// One podium step, resting on y = 0 with its centre at `x`.
+    static func makeStep(name: String, color: UIColor, height: Float, x: Float) -> ModelEntity {
+        let step = ModelEntity(mesh: stepMesh(height: height), materials: [material(color)])
         step.name = name
         step.position = [x, height / 2, 0]
-        addStaticPhysics(
-            to: step,
-            shape: .generateBox(
-                width: Metrics.stepWidth,
-                height: height,
-                depth: Metrics.stepDepth
-            )
-        )
+        addStaticPhysics(to: step, shape: stepShape(height: height))
         return step
+    }
+
+    /// Re-sizes a step in place, mesh and collider together, and re-seats it so
+    /// it still rests on the anchor plane (FR-012).
+    ///
+    /// The pair comes from `PodiumBreathing`'s pre-built ladder, so this is
+    /// three assignments and no allocation.
+    static func resize(
+        _ step: ModelEntity,
+        mesh: MeshResource,
+        shape: ShapeResource,
+        height: Float
+    ) {
+        step.model?.mesh = mesh
+        step.collision?.shapes = [shape]
+        step.position.y = height / 2
     }
 
     /// The trophy: base + stem + an **open** cup.

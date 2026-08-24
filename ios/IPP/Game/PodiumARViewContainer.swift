@@ -271,6 +271,43 @@ struct PodiumARViewContainer: UIViewRepresentable {
         /// is the +1 tier (FR-005).
         private var cupContactIDs: Set<ObjectIdentifier> = []
 
+        // MARK: Scenery state (Phase 5B — FR-012, FR-013)
+
+        /// The three step entities, cached at placement so the breathing update
+        /// does not walk the hierarchy sixty times a second.
+        private var stepEntities: [PodiumBuilder.Step: ModelEntity] = [:]
+        /// Each step's height *right now*. Everything that rides a step — the
+        /// trophy, the name label — is placed from this rather than from the
+        /// step's resting height (FR-012).
+        private var stepHeights: [PodiumBuilder.Step: Float] = [:]
+        /// Which rung of the breathing ladder each step is currently showing,
+        /// so a frame that does not change the rung costs nothing.
+        private var stepRungs: [PodiumBuilder.Step: Int] = [:]
+        /// The breathing clock. Advances only while the trophy is still, so a
+        /// celebration freezes the podium and then resumes from the same phase
+        /// instead of jumping (FR-012).
+        private var breathTime: TimeInterval = 0
+        /// The crawl clock. Never pauses — the crawl is scenery and touches
+        /// nothing (FR-013).
+        private var crawlTime: TimeInterval = 0
+        /// The name labels and the crawl, built once at placement.
+        private var standings: StandingsDisplay.Display?
+        /// When the current +1 pulse finishes, in `CACurrentMediaTime()`
+        /// seconds. Zero when no pulse is running.
+        private var pulseEndsAt: TimeInterval = 0
+
+        /// True while any animation owns the trophy's transform — the light
+        /// pulse of a cup hit, the swell of a make, or the slide to a new step.
+        ///
+        /// The breathing update writes the trophy's transform every frame, so
+        /// it has to stand back while an animation is doing the same; that is
+        /// also exactly the pause FR-012 asks for around the celebration. It is
+        /// deliberately *not* `isCupMoving`, which additionally suspends
+        /// scoring: a +1 pulse must not stop the same ball going on to make.
+        private var isTrophyAnimating: Bool {
+            isCupMoving || CACurrentMediaTime() < pulseEndsAt
+        }
+
         /// How long the cup takes to slide to its new step.
         private static let cupMoveDuration: TimeInterval = 0.4
         /// How long the trophy holds its celebratory swell before the move.
@@ -458,6 +495,8 @@ struct PodiumARViewContainer: UIViewRepresentable {
             cupEntity = scene.findEntity(named: PodiumBuilder.Name.cup)
             currentStep = .gold
             isCupMoving = false
+            pulseEndsAt = 0
+            installScenery(in: scene)
             subscribeToCupContacts(in: arView, anchor: anchor)
             // Warms the Taptic Engine so the first score's haptic is immediate.
             successHaptics.prepare()
@@ -468,6 +507,112 @@ struct PodiumARViewContainer: UIViewRepresentable {
             // over if tracking degrades.
             coachingOverlay.activatesAutomatically = false
             coachingOverlay.setActive(false, animated: true)
+        }
+
+        // MARK: - Scenery (FR-012, FR-013)
+
+        /// Wires up everything the podium does for show: the breathing steps
+        /// and the synthetic standings.
+        ///
+        /// The standings are invented on the spot by `SyntheticStandings` — no
+        /// leaderboard is read and no request is made, here or anywhere in the
+        /// game (FR-008, SC-005).
+        private func installScenery(in scene: Entity) {
+            stepEntities = [:]
+            stepHeights = [:]
+            stepRungs = [:]
+            breathTime = 0
+            crawlTime = 0
+
+            for step in PodiumBuilder.Step.allCases {
+                guard let entity = scene.findEntity(named: step.entityName) as? ModelEntity else {
+                    continue
+                }
+                stepEntities[step] = entity
+                stepHeights[step] = step.height
+            }
+            // Build the ladder now rather than on the first breathing frame, so
+            // the one-off mesh generation lands in the placement frame, which is
+            // already building a scene, instead of stuttering a second later.
+            _ = PodiumBreathing.ladders
+
+            standings = StandingsDisplay.attach(to: scene, standings: SyntheticStandings.standings())
+
+            // Put the steps on their phase-zero rungs now, so the podium
+            // appears already breathing instead of snapping into shape on the
+            // frame after it is placed.
+            breathe()
+        }
+
+        /// Drops the cached scenery handles. The entities themselves go with
+        /// the anchor, which the caller removes.
+        private func clearScenery() {
+            stepEntities = [:]
+            stepHeights = [:]
+            stepRungs = [:]
+            standings = nil
+            breathTime = 0
+            crawlTime = 0
+        }
+
+        /// One frame of scenery: the steps breathe, the labels follow them and
+        /// turn to the player, the crawl marches.
+        ///
+        /// None of it can affect play. The steps' colliders are swapped with
+        /// their meshes so a ball always rests on what it looks like it is
+        /// resting on; the labels and the crawl have no collider at all.
+        private func stepScenery(deltaTime: TimeInterval) {
+            guard podiumAnchor != nil else { return }
+
+            // FR-012: hold the podium still while the trophy is mid-animation.
+            // The clock stops too, so the breath resumes where it left off.
+            if !isTrophyAnimating {
+                breathTime += deltaTime
+                breathe()
+            }
+
+            guard let standings else { return }
+            crawlTime += deltaTime
+            StandingsDisplay.update(standings, at: crawlTime)
+            seatLabels(standings)
+        }
+
+        /// Moves each step to the rung its height function asks for, mesh and
+        /// collider together, and re-seats the trophy on top of whichever step
+        /// it is standing on.
+        private func breathe() {
+            for step in PodiumBuilder.Step.allCases {
+                guard let entity = stepEntities[step],
+                      let ladder = PodiumBreathing.ladder(for: step)
+                else { continue }
+
+                let index = ladder.index(nearest: PodiumBreathing.height(for: step, at: breathTime))
+                guard index != stepRungs[step] else { continue }
+                stepRungs[step] = index
+
+                let rung = ladder.rungs[index]
+                PodiumBuilder.resize(entity, mesh: rung.mesh, shape: rung.shape, height: rung.height)
+                stepHeights[step] = rung.height
+            }
+            // Nothing else owns the trophy right now (`isTrophyAnimating` is
+            // false), so it simply stands on its step's current top face.
+            trophyEntity?.transform = trophyRestTransform
+        }
+
+        /// Keeps the three name labels on their steps and facing the player
+        /// (FR-013). Runs even while the podium holds its breath — the player
+        /// can still walk around it.
+        private func seatLabels(_ display: StandingsDisplay.Display) {
+            guard let arView else { return }
+            let camera = arView.cameraTransform.translation
+            for label in display.labels {
+                StandingsDisplay.seat(
+                    label.entity,
+                    on: label.step,
+                    height: stepHeights[label.step] ?? label.step.height
+                )
+                StandingsDisplay.billboard(label.entity, toward: camera)
+            }
         }
 
         /// Listens for balls touching the cup — the +1 tier (FR-005).
@@ -529,6 +674,8 @@ struct PodiumARViewContainer: UIViewRepresentable {
             cupEntity = nil
             currentStep = .gold
             isCupMoving = false
+            pulseEndsAt = 0
+            clearScenery()
             arView.scene.removeAnchor(anchor)
             podiumAnchor = nil
             model.phase = hasSeenPlane ? .readyToPlace : .scanning
@@ -591,7 +738,7 @@ struct PodiumARViewContainer: UIViewRepresentable {
                   let frame = arView.session.currentFrame
             else { return }
 
-            let camera = TossController.CameraBasis(transform: frame.camera.transform)
+            let camera = cameraBasis(in: arView, transform: frame.camera.transform)
             // `ARView.ray(through:)` owns the projection matrix and the
             // interface orientation, so the touch point lands in the world
             // correctly without this file having to know either. A nil result
@@ -611,6 +758,53 @@ struct PodiumARViewContainer: UIViewRepresentable {
             case .launched(let launch):
                 spawn(launch, on: anchor)
             }
+        }
+
+        /// The camera pose the throw is computed from, with its sideways axis
+        /// **measured** rather than assumed (Q4, Gate 5 row 5-g5).
+        ///
+        /// `TossController.CameraBasis(transform:orientation:)` already knows
+        /// how to read ARKit's landscape-right transform in a portrait app, but
+        /// that is a convention this file would be trusting from documentation.
+        /// ``measuredScreenRight(in:)`` asks the view itself instead, through
+        /// the same `ARView.ray(through:)` that the touch-anchored spawn has
+        /// been using correctly since Gate 5 row 5-g3 — so the axis comes from
+        /// the projection that is actually on screen. The derived basis is only
+        /// the fallback, for the frames where the view has no valid camera yet.
+        private func cameraBasis(
+            in arView: ARView,
+            transform: simd_float4x4
+        ) -> TossController.CameraBasis {
+            let derived = TossController.CameraBasis(transform: transform, orientation: .portrait)
+            guard let measured = measuredScreenRight(in: arView) else { return derived }
+            return TossController.CameraBasis(
+                position: derived.position,
+                forward: derived.forward,
+                right: measured
+            )
+        }
+
+        /// World-space direction of "one point further right on the screen",
+        /// read off the view's own projection.
+        ///
+        /// Two rays through points on the same screen row differ only by the
+        /// horizontal sweep of the projection, so the difference of their unit
+        /// directions points along screen-right — with the interface
+        /// orientation, the field of view and any lens distortion correction
+        /// already baked in by `ARView`.
+        private func measuredScreenRight(in arView: ARView) -> SIMD3<Float>? {
+            let bounds = arView.bounds
+            guard bounds.width > 4, bounds.height > 4 else { return nil }
+            let inset = bounds.width / 4
+            guard let left = arView.ray(through: CGPoint(x: bounds.midX - inset, y: bounds.midY)),
+                  let right = arView.ray(through: CGPoint(x: bounds.midX + inset, y: bounds.midY)),
+                  simd_length_squared(left.direction) > 1e-12,
+                  simd_length_squared(right.direction) > 1e-12
+            else { return nil }
+
+            let delta = simd_normalize(right.direction) - simd_normalize(left.direction)
+            guard simd_length_squared(delta) > 1e-8 else { return nil }
+            return simd_normalize(delta)
         }
 
         /// Puts one ball into the scene and pushes it.
@@ -748,12 +942,15 @@ struct PodiumARViewContainer: UIViewRepresentable {
         }
 
         /// The trophy's pose when nothing is animating: upright, unscaled, on
-        /// whichever step the cup currently belongs to.
+        /// whichever step the cup currently belongs to — at that step's
+        /// **current** height, because the podium breathes (FR-012).
         private var trophyRestTransform: Transform {
             Transform(
                 scale: .one,
                 rotation: simd_quatf(angle: 0, axis: [0, 1, 0]),
-                translation: currentStep.trophyPosition
+                translation: currentStep.trophyPosition(
+                    atHeight: stepHeights[currentStep] ?? currentStep.height
+                )
             )
         }
 
@@ -778,6 +975,9 @@ struct PodiumARViewContainer: UIViewRepresentable {
         /// trophy.
         private func pulse(scale: Float, rise: TimeInterval, fall: TimeInterval) {
             guard !isCupMoving, let trophy = trophyEntity else { return }
+            // Claim the trophy for the length of the animation, so the
+            // breathing update does not overwrite it mid-swell (FR-012).
+            pulseEndsAt = CACurrentMediaTime() + rise + fall + 0.05
             let rest = trophyRestTransform
             var swollen = rest
             swollen.scale = rest.scale * scale
@@ -799,10 +999,16 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
         // MARK: - Culling (FR-006, SC-006)
 
-        /// One frame of the game: the round clock, then the balls.
+        /// One frame of the game: the round clock, then the scenery, then the
+        /// balls.
+        ///
+        /// The scenery goes before the balls on purpose: a step that has grown
+        /// this frame has already grown by the time the culler measures where a
+        /// ball is sitting on it.
         private func step(deltaTime: TimeInterval) {
             guard !isTornDown else { return }
             model.tick(deltaTime)
+            stepScenery(deltaTime: deltaTime)
             stepBalls(deltaTime: deltaTime)
         }
 
@@ -1018,6 +1224,8 @@ struct PodiumARViewContainer: UIViewRepresentable {
             trophyEntity = nil
             cupEntity = nil
             isCupMoving = false
+            pulseEndsAt = 0
+            clearScenery()
             swipeStart = nil
 
             coachingOverlay.delegate = nil
