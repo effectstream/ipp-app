@@ -22,6 +22,8 @@
     <string>1</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>IPP usa la cámara únicamente en el mini-juego de realidad aumentada "Tiro al Trofeo", para detectar una superficie y colocar el podio sobre ella. No se graban ni se envían imágenes.</string>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UISupportedInterfaceOrientations</key>

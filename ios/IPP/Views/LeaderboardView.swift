@@ -8,6 +8,12 @@ struct LeaderboardView: View {
     @State private var entries: [LeaderboardEntry] = []
     @State private var loading = true
     @State private var error: String?
+    @State private var showingGame = false
+
+    /// The AR mini-game only runs where ARKit world tracking does — elsewhere
+    /// (Simulator, unsupported hardware) the entry point stays disabled with an
+    /// explanation (FR-001). Reading this never touches the camera.
+    private var gameAvailable: Bool { ARSupport.isWorldTrackingSupported }
 
     var body: some View {
         NavigationStack {
@@ -24,6 +30,14 @@ struct LeaderboardView: View {
                             .font(.callout)
                             .foregroundStyle(Color.ippBody)
                     }
+                }
+
+                Section {
+                    gameRow
+                } footer: {
+                    Text(gameAvailable
+                         ? "Mini-juego de realidad aumentada. Es solo por diversión: no cambia tus puntos."
+                         : ARSupport.unsupportedMessage)
                 }
 
                 Section {
@@ -63,7 +77,44 @@ struct LeaderboardView: View {
                 }
             }
             .task { await load() }
+            .fullScreenCover(isPresented: $showingGame) {
+                TrophyTossView()
+            }
         }
+    }
+
+    private var gameRow: some View {
+        Button {
+            showingGame = true
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(gameAvailable ? Color.ippGoldSoft : Color(.tertiarySystemFill))
+                        .frame(width: 36, height: 36)
+                    Image(systemName: "trophy.fill")
+                        .font(.title3)
+                        .foregroundStyle(gameAvailable ? Color.ippGold : Color.ippMuted)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Jugar")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(gameAvailable ? Color.ippInk : Color.ippMuted)
+                    Text("Tiro al Trofeo · encesta en el podio")
+                        .font(.caption)
+                        .foregroundStyle(Color.ippMuted)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.ippFaint)
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!gameAvailable)
+        .opacity(gameAvailable ? 1 : 0.55)
     }
 
     private func heroCard(username: String) -> some View {
