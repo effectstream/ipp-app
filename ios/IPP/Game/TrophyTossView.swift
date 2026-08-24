@@ -4,13 +4,16 @@ import UIKit
 /// Entry screen of the "Tiro al Trofeo" AR mini-game, launched from the
 /// leaderboard.
 ///
-/// This screen owns the camera-permission story: it asks for the camera when it
-/// appears — the only moment the app ever asks (FR-010) — and renders a Spanish
-/// explanation with a shortcut to Ajustes when the answer is no. The AR scene
-/// itself arrives in a later phase; for now `readyState` is its placeholder.
+/// Two faces, chosen by whether the game can actually run:
+/// - the **AR screen** (`gameScreen`) — a full-bleed `PodiumARViewContainer`
+///   with a thin Spanish overlay: hint, Reubicar, close (FR-002, FR-009);
+/// - the **explainer screen** (`infoScreen`) — the camera-permission story.
+///   It asks for the camera when this view appears, the only moment the app
+///   ever asks (FR-010), and offers a shortcut to Ajustes when the answer is no.
 ///
-/// The game is fully offline: this file makes no network request and never
-/// touches `AppEnvironment` or the leaderboard data (FR-008).
+/// Closing the screen removes the AR container, which tears the session down
+/// (FR-011). The game is fully offline: this file makes no network request and
+/// never touches `AppEnvironment` or the leaderboard data (FR-008).
 struct TrophyTossView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -20,7 +23,113 @@ struct TrophyTossView: View {
     /// Guards against asking twice if the view's task runs again.
     @State private var didAsk = false
 
+    /// State shared with the `ARView`. Lives here so it survives the AR view's
+    /// own updates, and dies with this screen.
+    @StateObject private var arModel = PodiumARModel()
+
+    private var canPlay: Bool {
+        ARSupport.isWorldTrackingSupported && permission == .granted
+    }
+
     var body: some View {
+        Group {
+            if canPlay {
+                gameScreen
+            } else {
+                infoScreen
+            }
+        }
+        .task { await askForCameraIfNeeded() }
+        .onChange(of: scenePhase) { _, phase in
+            // Returning from Ajustes: the player may have changed the answer.
+            if phase == .active { permission = ARSupport.cameraPermission }
+        }
+    }
+
+    // MARK: - AR screen
+
+    private var gameScreen: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            PodiumARViewContainer(model: arModel)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                topBar
+                Spacer(minLength: 0)
+                hintBar
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 20)
+        }
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                dismiss()
+            } label: {
+                Label("Cerrar", systemImage: "xmark")
+                    .labelStyle(.iconOnly)
+                    .font(.headline)
+                    .frame(width: 40, height: 40)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .background(Color.ippInk.opacity(0.55), in: Circle())
+            .accessibilityLabel("Cerrar el juego")
+
+            Spacer(minLength: 0)
+
+            if arModel.isPlaced {
+                Button {
+                    arModel.relocate()
+                } label: {
+                    Label("Reubicar", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .frame(height: 40)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(Color.ippTeal.opacity(0.92), in: Capsule())
+            }
+        }
+    }
+
+    private var hintBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: hintIcon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(hintTint)
+            Text(arModel.hint)
+                .font(.subheadline)
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(Color.ippInk.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
+        .animation(.easeInOut(duration: 0.2), value: arModel.hint)
+    }
+
+    private var hintIcon: String {
+        if arModel.failure != nil { return "exclamationmark.triangle.fill" }
+        if arModel.trackingIssue != nil { return "viewfinder.trianglebadge.exclamationmark" }
+        return arModel.isPlaced ? "trophy.fill" : "hand.tap.fill"
+    }
+
+    private var hintTint: Color {
+        if arModel.failure != nil || arModel.trackingIssue != nil { return .ippGold }
+        return .white.opacity(0.85)
+    }
+
+    // MARK: - Explainer screen
+
+    private var infoScreen: some View {
         NavigationStack {
             ZStack {
                 Color.ippScreen.ignoresSafeArea()
@@ -41,11 +150,6 @@ struct TrophyTossView: View {
                     Button("Cerrar") { dismiss() }
                 }
             }
-        }
-        .task { await askForCameraIfNeeded() }
-        .onChange(of: scenePhase) { _, phase in
-            // Returning from Ajustes: the player may have changed the answer.
-            if phase == .active { permission = ARSupport.cameraPermission }
         }
     }
 
@@ -80,7 +184,7 @@ struct TrophyTossView: View {
             unsupportedState
         } else {
             switch permission {
-            case .granted: readyState
+            case .granted: openingState
             case .denied: deniedState
             case .restricted: restrictedState
             case .notDetermined: askingState
@@ -148,29 +252,15 @@ struct TrophyTossView: View {
         }
     }
 
-    /// Placeholder for the AR content that a later phase installs here.
-    private var readyState: some View {
-        card(icon: "checkmark.circle.fill", tint: .ippTeal, title: "Cámara lista") {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Ya podemos usar la cámara. La vista de realidad aumentada con el podio se añade en la siguiente entrega.")
+    /// Only ever on screen for the frame between the player granting the camera
+    /// and `canPlay` swapping this whole screen for `gameScreen`.
+    private var openingState: some View {
+        card(icon: "camera.fill", tint: .ippTeal, title: "Abriendo la cámara") {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("Preparando la vista de realidad aumentada…")
                     .font(.callout)
                     .foregroundStyle(Color.ippBody)
-                RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(
-                        Color.ippFaint,
-                        style: StrokeStyle(lineWidth: 1.5, dash: [6, 5])
-                    )
-                    .frame(height: 180)
-                    .overlay(
-                        VStack(spacing: 6) {
-                            Image(systemName: "arkit")
-                                .font(.largeTitle)
-                                .foregroundStyle(Color.ippFaint)
-                            Text("Vista AR · próximamente")
-                                .font(.caption)
-                                .foregroundStyle(Color.ippMuted)
-                        }
-                    )
             }
         }
     }
