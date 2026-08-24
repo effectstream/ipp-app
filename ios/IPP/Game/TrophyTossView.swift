@@ -6,8 +6,9 @@ import UIKit
 ///
 /// Two faces, chosen by whether the game can actually run:
 /// - the **AR screen** (`gameScreen`) — a full-bleed `PodiumARViewContainer`
-///   with a thin Spanish overlay: hint, Reubicar, close and the session score
-///   (FR-002, FR-005, FR-009);
+///   with a thin Spanish overlay: hint, Reubicar, close, the round HUD
+///   (countdown + score) and the end-of-round summary
+///   (FR-002, FR-005, FR-007, FR-009);
 /// - the **explainer screen** (`infoScreen`) — the camera-permission story.
 ///   It asks for the camera when this view appears, the only moment the app
 ///   ever asks (FR-010), and offers a shortcut to Ajustes when the answer is no.
@@ -44,6 +45,9 @@ struct TrophyTossView: View {
         .onChange(of: scenePhase) { _, phase in
             // Returning from Ajustes: the player may have changed the answer.
             if phase == .active { permission = ARSupport.cameraPermission }
+            // A round must not burn its clock while the app is away (FR-007,
+            // edge case "backgrounding mid-round").
+            arModel.setPaused(phase != .active, reason: .backgrounded)
         }
     }
 
@@ -56,15 +60,34 @@ struct TrophyTossView: View {
             PodiumARViewContainer(model: arModel)
                 .ignoresSafeArea()
 
-            VStack(spacing: 0) {
+            VStack(spacing: 10) {
                 topBar
+                if arModel.isPlaced {
+                    HStack(spacing: 0) {
+                        Spacer(minLength: 0)
+                        relocateButton
+                    }
+                }
                 Spacer(minLength: 0)
-                hintBar
+                // Both are hidden behind the summary card rather than dimmed
+                // under it — the overlay owns the screen while it is up.
+                if !arModel.round.hasEnded {
+                    if arModel.isPlaced && arModel.round.isIdle {
+                        startButton
+                    }
+                    hintBar
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
             .padding(.bottom, 20)
+
+            if arModel.round.hasEnded {
+                summaryOverlay
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
         }
+        .animation(.snappy(duration: 0.28), value: arModel.round.hasEnded)
     }
 
     private var topBar: some View {
@@ -84,43 +107,184 @@ struct TrophyTossView: View {
 
             Spacer(minLength: 0)
 
-            if arModel.isPlaced {
-                Button {
-                    arModel.relocate()
-                } label: {
-                    Label("Reubicar", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.subheadline.weight(.semibold))
-                        .padding(.horizontal, 14)
-                        .frame(height: 40)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .background(Color.ippTeal.opacity(0.92), in: Capsule())
+            if arModel.round.isRunning {
+                countdownPill
+            }
 
+            if arModel.isPlaced {
                 scorePill
             }
         }
     }
 
-    /// The whole HUD for now: how many balls have gone in since the screen
-    /// opened. Phase 4 puts a countdown and a round score in its place (FR-007).
+    /// Time left in the round (FR-007). Turns gold under ten seconds and says
+    /// so out loud when the clock is stopped for tracking or backgrounding.
+    private var countdownPill: some View {
+        HStack(spacing: 7) {
+            Image(systemName: arModel.round.isPaused ? "pause.fill" : "timer")
+                .font(.subheadline.weight(.semibold))
+            Text(arModel.round.countdownText)
+                .font(.title3.weight(.bold))
+                .monospacedDigit()
+        }
+        .foregroundStyle(countdownTint)
+        .padding(.horizontal, 14)
+        .frame(height: 40)
+        .background(Color.ippInk.opacity(0.65), in: Capsule())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(arModel.round.isPaused ? "Ronda en pausa" : "Tiempo restante")
+        .accessibilityValue(arModel.round.countdownText)
+    }
+
+    private var countdownTint: Color {
+        if arModel.round.isPaused { return .ippGold }
+        return arModel.round.remaining <= 10 ? .ippGold : .white
+    }
+
+    /// Points: the round's while one is on, the free-practice tally before that.
     private var scorePill: some View {
         HStack(spacing: 7) {
             Image(systemName: "trophy.fill")
                 .font(.subheadline.weight(.semibold))
-            Text("\(arModel.score)")
+            Text("\(arModel.displayedScore)")
                 .font(.title3.weight(.bold))
                 .monospacedDigit()
-                .contentTransition(.numericText(value: Double(arModel.score)))
+                .contentTransition(.numericText(value: Double(arModel.displayedScore)))
         }
         .foregroundStyle(Color.ippGold)
         .padding(.horizontal, 14)
         .frame(height: 40)
         .background(Color.ippInk.opacity(0.65), in: Capsule())
-        .animation(.snappy(duration: 0.25), value: arModel.score)
+        .animation(.snappy(duration: 0.25), value: arModel.displayedScore)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Puntos")
-        .accessibilityValue("\(arModel.score)")
+        .accessibilityLabel(arModel.round.isIdle ? "Puntos de práctica" : "Puntos de la ronda")
+        .accessibilityValue("\(arModel.displayedScore)")
+    }
+
+    /// Moving the podium mid-round would pull the target out from under a
+    /// running clock, so the button is disabled rather than hidden — the player
+    /// can see it will come back.
+    private var relocateButton: some View {
+        Button {
+            arModel.relocate()
+        } label: {
+            Label("Reubicar", systemImage: "arrow.triangle.2.circlepath")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 14)
+                .frame(height: 36)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white)
+        .background(Color.ippTeal.opacity(arModel.canRelocate ? 0.92 : 0.35), in: Capsule())
+        .opacity(arModel.canRelocate ? 1 : 0.55)
+        .disabled(!arModel.canRelocate)
+    }
+
+    /// Starts a timed round (FR-007). Only appears once the podium is down —
+    /// before that there is nothing to aim at.
+    private var startButton: some View {
+        Button {
+            arModel.startRound()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "play.fill")
+                Text("Comenzar")
+                    .font(.headline)
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 52)
+            .background(LinearGradient.ippBrand, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Comenzar una ronda de \(Int(arModel.round.rules.duration)) segundos")
+    }
+
+    // MARK: - End-of-round summary (FR-007, FR-008)
+
+    private var summaryOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.55)
+                .ignoresSafeArea()
+
+            VStack(spacing: 16) {
+                summaryCard
+                summaryActions
+            }
+            .padding(.horizontal, 24)
+        }
+    }
+
+    private var summaryCard: some View {
+        VStack(spacing: 10) {
+            Text("Ronda terminada")
+                .font(.headline)
+                .foregroundStyle(.white.opacity(0.85))
+
+            Text("\(arModel.round.finalScore ?? 0)")
+                .font(.system(size: 64, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+
+            Text(scoreWord(arModel.round.finalScore ?? 0))
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.85))
+
+            if arModel.didSetRecord {
+                Label("¡Nuevo récord!", systemImage: "sparkles")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Color.ippGold)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.white.opacity(0.16), in: Capsule())
+            } else {
+                Text("Tu mejor marca: \(arModel.bestScore)")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 26)
+        .padding(.horizontal, 20)
+        .background(LinearGradient.ippBrand)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+    }
+
+    private var summaryActions: some View {
+        VStack(spacing: 10) {
+            Button {
+                arModel.startRound()
+            } label: {
+                Text("Jugar de nuevo")
+                    .font(.headline)
+                    .foregroundStyle(Color.ippTealDeep)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 52)
+                    .background(Color.white, in: Capsule())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                arModel.returnToPractice()
+            } label: {
+                Text("Seguir practicando")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 44)
+                    .background(Color.white.opacity(0.18), in: Capsule())
+            }
+            .buttonStyle(.plain)
+
+            Button("Salir del juego") { dismiss() }
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.8))
+                .padding(.top, 2)
+        }
+    }
+
+    private func scoreWord(_ score: Int) -> String {
+        score == 1 ? "punto" : "puntos"
     }
 
     private var hintBar: some View {

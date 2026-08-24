@@ -18,29 +18,65 @@ import simd
 ///   upward flick has a *negative* `translation.y`.
 /// - **World space** is RealityKit's: metres, `+y` up.
 ///
-/// # Tuning (Gate 3)
+/// # Tuning (Gate 3 → Phase 4)
 ///
 /// Every number the game's feel depends on is a stored property of `Tuning`, so
-/// the owner's Gate 3 feedback ("too weak", "too floaty", "curves too much")
-/// turns into a one-line edit of ``Tuning/init()``'s defaults rather than a hunt
-/// through the AR code.
+/// the owner's feedback ("too weak", "too floaty", "curves too much") turns into
+/// a one-line edit of ``Tuning/init()``'s defaults rather than a hunt through
+/// the AR code.
 ///
-/// The launch-speed range is picked from the actual geometry rather than by
-/// eye. The podium is ~30 cm wide and the cup mouth sits ~0.17 m above the
-/// surface it stands on; a player holds the phone ~0.35 m above that surface and
-/// stands 0.5–1.0 m away. Firing at ``Tuning/arc`` = 0.45 world-up per unit of
-/// aim (≈ 24° above where the phone points) and solving the projectile equations
-/// for those distances under RealityKit's 9.81 m/s² gravity gives:
+/// ## Where the launch-speed range comes from
 ///
-/// | Distance to the cup | Speed that lands in it |
-/// |---|---|
-/// | 0.5 m | ≈ 1.9 m/s |
-/// | 0.7 m | ≈ 2.4 m/s |
-/// | 1.0 m | ≈ 3.1 m/s |
+/// Not from eye-balling. The scene fixes the geometry: the cup's floor sits
+/// 0.166 m and its mouth 0.226 m above the surface the podium stands on, so a
+/// ball has to arrive at ≈ 0.20 m. A player holds the phone ≈ 0.35 m above that
+/// surface and the ball leaves ``Tuning/spawnDownOffset`` below the camera, so
+/// it starts at ≈ 0.31 m — i.e. it has to **drop** ≈ 0.11 m over the throw.
 ///
-/// So the flick maps onto **1.6 … 4.5 m/s**: the band brackets that 1.9–3.1
-/// sweet spot with room on both sides, which is what makes it a game — a limp
-/// flick drops short, a hard one sails over the podium.
+/// Every throw leaves along `normalize(aim + worldUp · arc + side · lateral)`.
+/// With ``Tuning/arc`` = 0.45 that is 24.2° above the aim **when the phone is
+/// level** — but the player is looking down at a podium on a table, and the loft
+/// is added along *world* up, so a downward tilt eats straight into the launch
+/// angle. That is the part the first (4.5 m/s) ceiling missed, and it is why
+/// Gate 3 row 3.1 reported having to walk the camera closer.
+///
+/// Solving `x = v·cosθ·t`, `Δy = v·sinθ·t − ½gt²` at g = 9.81 m/s²:
+///
+/// | Distance | Phone aimed at the cup | Phone tilted 20° down |
+/// |---|---|---|
+/// | 0.5 m | 2.4 m/s (θ ≈ 13.5°) | 2.7 m/s (θ ≈ 6.6°) |
+/// | 0.7 m | 2.9 m/s | 3.6 m/s |
+/// | 1.0 m | 3.5 m/s | 4.7 m/s |
+/// | 1.5 m | 4.3 m/s | 6.3 m/s |
+/// | 2.0 m | 5.0 m/s | 7.7 m/s |
+///
+/// So the old 4.5 m/s ceiling topped out at ~1.7 m with a flat aim and **0.9 m**
+/// with a 20° tilt — hence "move closer". ``Tuning/maxLaunchSpeed`` is now
+/// **6.8 m/s**, which reaches ~2.8 m aimed flat and ~1.7 m at a steep tilt: a
+/// hard flick clears the ~2 m the owner asked for without walking, and the
+/// 7 m/s-ish worst case is only out of reach if the player insists on staring at
+/// their own feet.
+///
+/// ## Why the mapping is a curve, not a line
+///
+/// Raising the ceiling with the old straight line would have dragged every mid
+/// flick up with it (a 1200 pt/s flick would jump 2.8 → 3.8 m/s and sail over a
+/// cup 0.7 m away). Instead the flick fraction is raised to
+/// ``Tuning/powerCurve`` = 1.8 before it is mixed, which keeps the low and
+/// middle of the range where Gate 3 said it already felt right and spends all
+/// the new headroom on the hardest flicks:
+///
+/// | Upward flick | Launch speed | Lands about |
+/// |---|---|---|
+/// | 600 pt/s (lazy) | 1.8 m/s | short of 0.4 m |
+/// | 1000 pt/s | 2.5 m/s | ≈ 0.55 m |
+/// | 1200 pt/s | 2.9 m/s | ≈ 0.75 m |
+/// | 1400 pt/s | 3.5 m/s | ≈ 1.0 m |
+/// | 1800 pt/s | 4.9 m/s | ≈ 1.8 m |
+/// | 2200 pt/s (hard) | 6.8 m/s | ≈ 2.8 m |
+///
+/// ``Tuning/fastFlick`` also came down 2400 → 2200 pt/s so the ceiling is
+/// actually reachable by a thumb rather than being a number in a file.
 struct TossController {
 
     // MARK: - Tuning
@@ -64,14 +100,24 @@ struct TossController {
 
         /// Speed of the weakest launch, in m/s. Undershoots from ~0.5 m.
         var minLaunchSpeed: Float = 1.6
-        /// Speed of the hardest launch, in m/s. Overshoots from ~1.0 m.
-        var maxLaunchSpeed: Float = 4.5
+        /// Speed of the hardest launch, in m/s. Reaches ~2.8 m with the phone
+        /// aimed flat, ~1.7 m with it tilted well down (Gate 3 row 3.1: the
+        /// previous 4.5 m/s made the player walk closer).
+        var maxLaunchSpeed: Float = 6.8
         /// Upward flick speed (points/second) that still maps to
         /// ``minLaunchSpeed`` — a slow drag.
         var slowFlick: Float = 350
         /// Upward flick speed (points/second) that reaches ``maxLaunchSpeed``.
-        /// A brisk thumb flick covers ~250 pt in ~0.10 s.
-        var fastFlick: Float = 2400
+        /// A hard thumb flick covers ~250 pt in ~0.11 s.
+        var fastFlick: Float = 2200
+        /// Shape of the flick → speed curve: the normalised flick fraction is
+        /// raised to this power before it is mixed between the two speeds.
+        ///
+        /// `1` is the straight line Phase 3 used. Above 1 the curve sags, so the
+        /// gentle and middling flicks keep the speeds they had before the
+        /// ceiling was raised and only the hardest flicks reach the new top end
+        /// — which is the whole point of 4.0a: more reach, same sweet spot.
+        var powerCurve: Float = 1.8
         /// Floor on the measured swipe duration, so a gesture the system reports
         /// as near-instant cannot divide its way to an absurd flick speed.
         var minimumSwipeDuration: TimeInterval = 0.05
@@ -118,6 +164,32 @@ struct TossController {
         /// Height relative to the anchor plane (metres, so negative is below the
         /// table) past which a ball has clearly left the play area.
         var minimumHeight: Float = -0.40
+
+        // Rim rescue (Gate 3 row 3.2) — a ball must never be balanced on the
+        // cup's rim when the rest-culler fires, because from the player's seat
+        // that reads as the ball evaporating.
+
+        /// How far *below* the rim's top face (as a fraction of the ball's
+        /// radius) a resting ball's centre may be and still count as perched on
+        /// the rim rather than sitting inside the cup.
+        ///
+        /// A ball inside the cup rests with its centre ≈ 0.7 radii **below** the
+        /// rim; one balanced on the rim sits a full radius above it. 0.4 splits
+        /// those two cases with room to spare on both sides.
+        var rimGraceFraction: Float = 0.40
+        /// Speed (m/s) of the destabilising shove given to a ball caught resting
+        /// on the rim. Big enough to topple it, small enough that it drops in or
+        /// falls off rather than being launched.
+        var rimNudgeSpeed: Float = 0.30
+        /// Downward part of that shove, as a fraction of its horizontal part, so
+        /// the ball commits to falling instead of skating along the rim.
+        var rimNudgeDownwardBias: Float = 0.35
+        /// How many times one ball may be nudged before it is culled anyway.
+        /// Bounds the worst case; in practice the first shove settles it.
+        var maximumRimNudges: Int = 3
+        /// Seconds of life handed back to a ball each time it is nudged, so the
+        /// shove has time to work before the same cull rule fires again.
+        var rimNudgeGrace: TimeInterval = 1.0
 
         init() {}
     }
@@ -246,12 +318,18 @@ struct TossController {
     /// and power independent: sideways travel steers (see ``lateralDeflection``)
     /// and never adds force, so a hard sideways swipe is a gentle, wide throw
     /// rather than a rocket.
+    ///
+    /// The flick fraction is shaped by ``Tuning/powerCurve`` before it is mixed,
+    /// so raising the ceiling for hard flicks (4.0a) did not also make every
+    /// ordinary flick overshoot. The function stays monotonic in flick speed for
+    /// any positive exponent.
     func launchSpeed(for swipe: Swipe) -> Float {
         let seconds = Float(max(swipe.duration, tuning.minimumSwipeDuration))
         let flick = swipe.upwardTravel / seconds
         let span = max(tuning.fastFlick - tuning.slowFlick, 1)
         let t = min(max((flick - tuning.slowFlick) / span, 0), 1)
-        return tuning.minLaunchSpeed + t * (tuning.maxLaunchSpeed - tuning.minLaunchSpeed)
+        let shaped = tuning.powerCurve == 1 ? t : pow(t, max(tuning.powerCurve, 0.01))
+        return tuning.minLaunchSpeed + shaped * (tuning.maxLaunchSpeed - tuning.minLaunchSpeed)
     }
 
     /// Sideways steering from the horizontal part of the swipe, as a fraction of
@@ -359,6 +437,66 @@ struct TossController {
         if restingFor >= tuning.restDuration { return .atRest }
         if age >= tuning.maximumAge { return .expired }
         return nil
+    }
+
+    // MARK: - Rim rescue (Gate 3 row 3.2)
+
+    /// Where a ball sits relative to the cup, reduced to the two numbers the
+    /// rim rule needs. Both are measured in the cup's own frame.
+    struct RimContact: Equatable {
+        /// Ball centre minus the top of the cup wall, in metres. Positive means
+        /// the ball is above the mouth.
+        var heightAboveRim: Float
+        /// Horizontal distance from the cup's axis, in metres.
+        var radialDistance: Float
+
+        init(heightAboveRim: Float, radialDistance: Float) {
+            self.heightAboveRim = heightAboveRim
+            self.radialDistance = radialDistance
+        }
+    }
+
+    /// Is this ball balanced on the cup's rim, rather than resting inside the
+    /// cup or somewhere else in the scene?
+    ///
+    /// Gate 3 row 3.2: balls occasionally came to rest on the 6 mm rim and were
+    /// then removed by the rest-culler, which looks to the player like the ball
+    /// vanishing. The geometry answers the question cleanly — a ball in the cup
+    /// has its centre below the rim, a ball on the rim has it a radius above —
+    /// so the caller can shove the perched one instead of deleting it.
+    func isPerchedOnRim(
+        _ contact: RimContact,
+        ballRadius: Float,
+        cupOuterRadius: Float
+    ) -> Bool {
+        contact.heightAboveRim > -ballRadius * tuning.rimGraceFraction
+            && contact.radialDistance < cupOuterRadius + ballRadius
+    }
+
+    /// The shove given to a perched ball: horizontal, in the direction
+    /// `azimuth` (radians, measured from +X toward +Z), with a downward bias so
+    /// it drops rather than skates.
+    ///
+    /// The direction is a parameter rather than a random draw so the rule stays
+    /// pure and testable; the AR side picks the angle. It is picked at random
+    /// there on purpose — a ball tipped off the rim should be as free to fall
+    /// *in* as to fall out, which is exactly what Gate 3 row 3.2 asked for.
+    func rimNudgeVelocity(azimuth: Float) -> SIMD3<Float> {
+        SIMD3<Float>(
+            cos(azimuth) * tuning.rimNudgeSpeed,
+            -tuning.rimNudgeSpeed * tuning.rimNudgeDownwardBias,
+            sin(azimuth) * tuning.rimNudgeSpeed
+        )
+    }
+
+    /// The same shove as an impulse (N·s).
+    func rimNudgeImpulse(azimuth: Float) -> SIMD3<Float> {
+        rimNudgeVelocity(azimuth: azimuth) * tuning.ballMass
+    }
+
+    /// Whether a ball that the culler wants to remove has any nudges left.
+    func mayNudgeOffRim(nudgesSoFar: Int) -> Bool {
+        nudgesSoFar < tuning.maximumRimNudges
     }
 
     /// Forgets a ball the caller has removed from the scene.

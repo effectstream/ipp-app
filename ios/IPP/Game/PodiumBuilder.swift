@@ -73,15 +73,54 @@ enum PodiumBuilder {
         static let cupFloorThickness: Float = 0.006
         /// Number of box segments approximating the cup's cylindrical wall.
         static let cupWallSegments = 12
+        /// How far each wall segment leans **outward**, in radians (Gate 3 row
+        /// 3.2). The cup is therefore a shallow cone rather than a tube: its
+        /// mouth is wider than its floor, the inner face funnels a ball down
+        /// into the cup, and — the point of the change — the rim has no level
+        /// surface anywhere on it for a ball to balance on.
+        ///
+        /// 15° against the rim's friction of ``cupRimFriction`` (0.18, whose
+        /// friction angle is ≈ 10°) means a ball landing on the rim always
+        /// slides off instead of settling there and being silently culled.
+        static let cupWallFlare: Float = 15 * .pi / 180
+        /// Friction of the rim and inner wall. Deliberately slippery, so the
+        /// flare above can do its job.
+        static let cupRimFriction: Float = 0.18
+        static let cupRimRestitution: Float = 0.18
 
         /// Invisible collision plane standing in for the real table or floor,
         /// so missed balls bounce on the surface instead of falling forever.
         static let floorExtent: Float = 3.0
         static let floorThickness: Float = 0.02
 
+        // Derived cup geometry. The game's rim rule (`TossController`) is
+        // written against these, so the numbers exist once.
+
+        /// Radius of the circle the wall segments' centres sit on.
+        static var cupRingRadius: Float { cupInnerRadius + cupWallThickness / 2 }
+        /// That radius at the mouth, once the segments lean out.
+        static var cupRimRingRadius: Float {
+            cupRingRadius + (cupWallHeight / 2) * sin(cupWallFlare)
+        }
+        /// Outermost horizontal reach of the rim — the "is this ball anywhere
+        /// near the cup" radius.
+        static var cupRimOuterRadius: Float { cupRimRingRadius + cupWallThickness }
+        /// Height of the top of the wall above the cup entity's own origin
+        /// (which is the underside of the cup's floor disc).
+        static var cupRimHeight: Float {
+            cupFloorThickness + cupWallHeight / 2 + (cupWallHeight / 2) * cos(cupWallFlare)
+        }
+
+        /// Inner radius of the flared wall at `height` above the cup's origin —
+        /// smallest at the floor, widest at the mouth.
+        static func cupInnerRadius(atHeight height: Float) -> Float {
+            let wallMidHeight = cupFloorThickness + cupWallHeight / 2
+            return cupInnerRadius + (height - wallMidHeight) * tan(cupWallFlare)
+        }
+
         /// Height of the whole trophy above the step it stands on.
         static var trophyHeight: Float {
-            trophyBaseHeight + trophyStemHeight + cupFloorThickness + cupWallHeight
+            trophyBaseHeight + trophyStemHeight + cupRimHeight
         }
     }
 
@@ -266,11 +305,18 @@ enum PodiumBuilder {
 
         // Wall: `cupWallSegments` thin boxes on a circle, forming a polygonal
         // ring that reads as a cylinder and collides like a container.
+        //
+        // Each segment also leans outward by `cupWallFlare`, which turns the
+        // tube into a shallow cone (Gate 3 row 3.2). Two consequences, both
+        // wanted: the inner face now funnels a ball toward the cup floor, and
+        // the top face is a slope rather than a ledge, so a ball can no longer
+        // come to rest on the rim and be culled out of existence.
         let segments = Metrics.cupWallSegments
-        let ringRadius = Metrics.cupInnerRadius + Metrics.cupWallThickness / 2
-        // Chord length of one segment, plus a hair of overlap so the ring has
-        // no gaps between neighbours.
-        let segmentWidth = 2 * ringRadius * sin(.pi / Float(segments)) * 1.08
+        let ringRadius = Metrics.cupRingRadius
+        // Chord length of one segment, measured at the **mouth**, where the
+        // flare has pushed the ring out furthest — sizing it at the mid radius
+        // would open gaps between neighbours at the top. Plus a hair of overlap.
+        let segmentWidth = 2 * Metrics.cupRimRingRadius * sin(.pi / Float(segments)) * 1.08
         let wallY = Metrics.cupFloorThickness + Metrics.cupWallHeight / 2
 
         for index in 0..<segments {
@@ -289,7 +335,11 @@ enum PodiumBuilder {
                 wallY,
                 ringRadius * cos(angle)
             ]
+            // Yaw puts the segment's local +Z along the outward radius and its
+            // local +X along the tangent; the second rotation then tips its top
+            // toward that outward radius.
             segment.orientation = simd_quatf(angle: angle, axis: [0, 1, 0])
+                * simd_quatf(angle: Metrics.cupWallFlare, axis: [1, 0, 0])
             addStaticPhysics(
                 to: segment,
                 shape: .generateBox(
@@ -297,8 +347,8 @@ enum PodiumBuilder {
                     height: Metrics.cupWallHeight,
                     depth: Metrics.cupWallThickness
                 ),
-                friction: 0.6,
-                restitution: 0.15
+                friction: Metrics.cupRimFriction,
+                restitution: Metrics.cupRimRestitution
             )
             cup.addChild(segment)
         }
@@ -312,9 +362,10 @@ enum PodiumBuilder {
     /// `CollisionEvents` to score a ball.
     static func makeCupTrigger() -> Entity {
         // Shorter than the wall so a ball perched on the rim does not count,
-        // and narrower so the sensor stays clear of the wall segments.
+        // and narrower so the sensor stays clear of the wall segments — which
+        // now lean *inward* at their base, so the clearance is measured there.
         let height = Metrics.cupWallHeight * 0.75
-        let side = (Metrics.cupInnerRadius - Metrics.cupWallThickness) * 1.4
+        let side = (Metrics.cupInnerRadius - Metrics.cupWallThickness) * 1.25
         let trigger = Entity()
         trigger.name = Name.cupTrigger
         trigger.position = [0, Metrics.cupFloorThickness + height / 2, 0]
@@ -357,9 +408,10 @@ enum PodiumBuilder {
     /// is where Gate 3's feel feedback gets applied — this function only turns
     /// those numbers into an entity.
     ///
-    /// Continuous collision detection is on: at 4.5 m/s a 3.5 cm ball moves
-    /// ~7.5 cm per 60 Hz step, further than the cup's 6 mm walls are thick, so
-    /// discrete stepping would let a hard throw tunnel straight through the cup.
+    /// Continuous collision detection is on: at the 6.8 m/s ceiling a 3.5 cm
+    /// ball moves ~11 cm per 60 Hz step, far further than the cup's 6 mm walls
+    /// are thick, so discrete stepping would let a hard throw tunnel straight
+    /// through the cup. (It mattered at Phase 3's 4.5 m/s; it matters more now.)
     static func makeBall(
         id: UInt64,
         radius: Float,
@@ -595,6 +647,26 @@ extension PodiumBuilder {
             }
             if trigger.components[CollisionComponent.self]?.mode != .trigger {
                 problems.append("cup trigger is not in .trigger mode")
+            }
+        }
+
+        // 4b. Cup geometry after the Gate 3 rim fix: the wall must flare
+        //     outward, still admit the ball at the bottom, and keep the scoring
+        //     trigger strictly below the rim so a perched ball cannot score.
+        let ballRadius = TossController.Tuning().ballRadius
+        let mouthRadius = Metrics.cupInnerRadius(atHeight: Metrics.cupRimHeight)
+        let baseRadius = Metrics.cupInnerRadius(atHeight: Metrics.cupFloorThickness)
+        if mouthRadius <= baseRadius {
+            problems.append("the cup narrows toward its mouth — the rim flare is inverted")
+        }
+        let restingHeight = Metrics.cupFloorThickness + ballRadius
+        if Metrics.cupInnerRadius(atHeight: restingHeight) <= ballRadius {
+            problems.append("the flared wall is too tight for a ball to reach the cup floor")
+        }
+        if let trigger = scene.findEntity(named: Name.cupTrigger) {
+            let triggerTop = trigger.position.y + Metrics.cupWallHeight * 0.75 / 2
+            if triggerTop >= Metrics.cupRimHeight {
+                problems.append("the scoring trigger reaches the rim — a perched ball could score")
             }
         }
 
