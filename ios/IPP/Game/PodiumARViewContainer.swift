@@ -302,8 +302,13 @@ struct PodiumARViewContainer: UIViewRepresentable {
         /// (FR-013).
         private var floorMap: FloorMapData
         /// The built map, kept so a late fetch can swap it without disturbing
-        /// anything else in the scene.
-        private weak var floorMapEntity: Entity?
+        /// anything else in the scene, and so the update loop can shimmer it.
+        private var floorMapDisplay: FloorMap.Display?
+        /// The floor map's clock. Never pauses — the dots are scenery on the
+        /// ground, they touch nothing, and freezing them during a celebration
+        /// would read as a glitch rather than as the podium holding its breath
+        /// (FR-013, task 5C.3).
+        private var floorMapTime: TimeInterval = 0
         /// The podium's scene root, cached so the map can be rebuilt into the
         /// same parent the rest of the scenery hangs from.
         private weak var podiumScene: Entity?
@@ -569,7 +574,8 @@ struct PodiumARViewContainer: UIViewRepresentable {
             stepHeights = [:]
             stepRungs = [:]
             standings = nil
-            floorMapEntity = nil
+            floorMapDisplay = nil
+            floorMapTime = 0
             podiumScene = nil
             breathTime = 0
         }
@@ -593,21 +599,24 @@ struct PodiumARViewContainer: UIViewRepresentable {
         /// Replaces the map under the podium with one drawn from the current
         /// pins. The map carries no collider and no physics body, so removing
         /// and re-adding it cannot disturb a ball in flight.
+        ///
+        /// The shimmer clock is deliberately **not** reset: a late fetch should
+        /// look like the data changing under a running animation, not like the
+        /// field restarting.
         private func rebuildFloorMap(in scene: Entity) {
-            floorMapEntity?.removeFromParent()
-            let map = FloorMap.make(floorMap)
-            scene.addChild(map)
-            floorMapEntity = map
+            floorMapDisplay?.root.removeFromParent()
+            let display = FloorMap.make(floorMap)
+            scene.addChild(display.root)
+            floorMapDisplay = display
+            FloorMap.update(display, at: floorMapTime)
         }
 
-        /// One frame of scenery: the steps breathe and the labels follow them
-        /// and turn to the player.
+        /// One frame of scenery: the steps breathe, the labels follow them and
+        /// turn to the player, and the floor map's dots pulse and blink.
         ///
         /// None of it can affect play. The steps' colliders are swapped with
         /// their meshes so a ball always rests on what it looks like it is
         /// resting on; the labels and the floor map have no collider at all.
-        /// The map is static — it is built at placement and never touched per
-        /// frame.
         private func stepScenery(deltaTime: TimeInterval) {
             guard podiumAnchor != nil else { return }
 
@@ -616,6 +625,11 @@ struct PodiumARViewContainer: UIViewRepresentable {
             if !isTrophyAnimating {
                 breathTime += deltaTime
                 breathe()
+            }
+
+            if let floorMapDisplay {
+                floorMapTime += deltaTime
+                FloorMap.update(floorMapDisplay, at: floorMapTime)
             }
 
             guard let standings else { return }
