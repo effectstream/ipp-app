@@ -138,17 +138,19 @@ final class PodiumARModel: ObservableObject {
         bestScore = bestScores.best
     }
 
-    /// A ball landed in the cup. It counts for the round if one is running, and
-    /// otherwise only for the free-practice tally (see `GameRound`).
+    /// A ball earned points — `TossController.Tuning.hitPoints` for touching
+    /// the cup, the rest of `makePoints` for landing in it (FR-005, amended at
+    /// Gate 4). They count for the round if one is running, and otherwise only
+    /// for the free-practice tally (see `GameRound`).
     ///
-    /// - Returns: `false` when the point counted for nothing — a ball already
+    /// - Returns: `false` when the points counted for nothing — a ball already
     ///   in flight when the round paused — so the caller can skip the fanfare
     ///   for a point the player did not get.
     @discardableResult
-    fileprivate func registerScore() -> Bool {
-        if round.registerScore() { return true }
+    fileprivate func registerScore(_ points: Int) -> Bool {
+        if round.registerScore(points) { return true }
         guard round.isIdle else { return false }
-        practiceScore += 1
+        practiceScore += points
         return true
     }
 
@@ -227,9 +229,10 @@ struct PodiumARViewContainer: UIViewRepresentable {
         /// exactly it, and so tracking recovery can be checked against it.
         private var podiumAnchor: AnchorEntity?
         private var subscriptions: [any Cancellable] = []
-        /// Cup-trigger subscription, held apart from the rest because it is made
-        /// and dropped with the podium rather than with the view.
-        private var cupSubscription: (any Cancellable)?
+        /// Collision subscription for the +1 tier, held apart from the rest
+        /// because it is made and dropped with the podium rather than with the
+        /// view.
+        private var contactSubscription: (any Cancellable)?
         private var lifecycleObservers: [NSObjectProtocol] = []
 
         private var hasSeenPlane = false
@@ -244,25 +247,45 @@ struct PodiumARViewContainer: UIViewRepresentable {
         private var balls: [LiveBall] = []
         /// When the current swipe started, in `CACurrentMediaTime()` seconds.
         private var swipeStart: TimeInterval?
-        /// The trophy's resting transform, captured at placement so the score
-        /// pulse always animates back to a known pose rather than to whatever
-        /// mid-animation value it happens to read.
-        private var trophyRestTransform: Transform?
         private let successHaptics = UINotificationFeedbackGenerator()
+        /// The lighter cue for the +1 tier, so a graze off the cup does not
+        /// feel like a made shot (FR-005).
+        private let hitHaptics = UIImpactFeedbackGenerator(style: .light)
 
-        /// The cup, cached at placement so the rim rule can measure a ball's
+        /// The cup, cached at placement so the cup rules can measure a ball's
         /// position in the cup's own frame without walking the hierarchy every
         /// frame.
         private weak var cupEntity: Entity?
+        /// The trophy, cached at placement. The difficulty ramp animates it
+        /// between steps inside its own parent, the steps container (US3).
+        private weak var trophyEntity: Entity?
+        /// Which step the cup is standing on right now.
+        private var currentStep: PodiumBuilder.Step = .gold
+        /// True from the moment a make is celebrated until the cup has finished
+        /// sliding to its new step. Nothing scores in that window: the trophy
+        /// is being scaled and moved, so every measurement taken in the cup's
+        /// frame is in motion (US3, and it keeps the Gate 4 defect from coming
+        /// back through the animation).
+        private var isCupMoving = false
+        /// Every collidable part of the cup, by identity. Touching any of them
+        /// is the +1 tier (FR-005).
+        private var cupContactIDs: Set<ObjectIdentifier> = []
+
+        /// How long the cup takes to slide to its new step.
+        private static let cupMoveDuration: TimeInterval = 0.4
+        /// How long the trophy holds its celebratory swell before the move.
+        private static let makeSwellDuration: TimeInterval = 0.14
 
         /// One ball in flight: the entity plus the timers the culling rules in
-        /// `TossController` are written against (FR-006), and how many times it
-        /// has been shoved off the cup's rim (Gate 3 row 3.2).
+        /// `TossController` are written against (FR-006), how long it has been
+        /// verifiably inside the cup (FR-005) and how many times it has been
+        /// shoved off the cup's rim (Gate 3 row 3.2).
         private struct LiveBall {
             let id: TossController.BallID
             let entity: ModelEntity
             var age: TimeInterval = 0
             var restingFor: TimeInterval = 0
+            var insideFor: TimeInterval = 0
             var rimNudges: Int = 0
         }
 
@@ -431,11 +454,14 @@ struct PodiumARViewContainer: UIViewRepresentable {
             model.phase = .placed
             model.transientHint = nil
 
-            trophyRestTransform = scene.findEntity(named: PodiumBuilder.Name.trophy)?.transform
+            trophyEntity = scene.findEntity(named: PodiumBuilder.Name.trophy)
             cupEntity = scene.findEntity(named: PodiumBuilder.Name.cup)
-            subscribeToCup(in: arView, anchor: anchor)
+            currentStep = .gold
+            isCupMoving = false
+            subscribeToCupContacts(in: arView, anchor: anchor)
             // Warms the Taptic Engine so the first score's haptic is immediate.
             successHaptics.prepare()
+            hitHaptics.prepare()
 
             // From here the player is looking at the podium, so stop the
             // full-screen coaching overlay from covering it; our own hint takes
@@ -444,16 +470,38 @@ struct PodiumARViewContainer: UIViewRepresentable {
             coachingOverlay.setActive(false, animated: true)
         }
 
-        /// Listens to the cup's invisible trigger volume, which is the only
-        /// thing that can turn a ball into a point (FR-005).
-        private func subscribeToCup(in arView: ARView, anchor: AnchorEntity) {
-            cupSubscription = nil
-            guard let trigger = anchor.findEntity(named: PodiumBuilder.Name.cupTrigger) else { return }
-            cupSubscription = arView.scene.subscribe(
-                to: CollisionEvents.Began.self,
-                on: trigger
-            ) { [weak self] event in
-                MainActor.assumeIsolated { self?.handleCupEntry(event) }
+        /// Listens for balls touching the cup — the +1 tier (FR-005).
+        ///
+        /// One subscription for the whole scene rather than thirteen (twelve
+        /// wall segments and the floor disc): the collidable parts of the cup
+        /// are collected once, by identity, and every other contact in the
+        /// scene — the table, the steps, ball against ball — is discarded with
+        /// a set lookup.
+        ///
+        /// Note what this subscription is **not** used for: landing inside the
+        /// cup. That is decided per frame from the ball's position, because a
+        /// contact cannot tell which side of a 6 mm wall the ball is on — the
+        /// Gate 4 defect in one sentence.
+        private func subscribeToCupContacts(in arView: ARView, anchor: AnchorEntity) {
+            contactSubscription = nil
+            cupContactIDs = []
+            guard let cup = anchor.findEntity(named: PodiumBuilder.Name.cup) else { return }
+
+            var identifiers: Set<ObjectIdentifier> = []
+            collectColliders(of: cup, into: &identifiers)
+            cupContactIDs = identifiers
+
+            contactSubscription = arView.scene.subscribe(to: CollisionEvents.Began.self) { [weak self] event in
+                MainActor.assumeIsolated { self?.handleContact(event) }
+            }
+        }
+
+        private func collectColliders(of entity: Entity, into identifiers: inout Set<ObjectIdentifier>) {
+            if entity.components[CollisionComponent.self] != nil {
+                identifiers.insert(ObjectIdentifier(entity))
+            }
+            for child in entity.children {
+                collectColliders(of: child, into: &identifiers)
             }
         }
 
@@ -475,9 +523,12 @@ struct PodiumARViewContainer: UIViewRepresentable {
             // not stay pinned at the balls that no longer exist.
             balls.removeAll()
             toss.retireAll()
-            cupSubscription = nil
-            trophyRestTransform = nil
+            contactSubscription = nil
+            cupContactIDs = []
+            trophyEntity = nil
             cupEntity = nil
+            currentStep = .gold
+            isCupMoving = false
             arView.scene.removeAnchor(anchor)
             podiumAnchor = nil
             model.phase = hasSeenPlane ? .readyToPlace : .scanning
@@ -489,9 +540,10 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
         /// A swipe anywhere on the AR view throws a ball. Power comes from how
         /// fast the finger travelled *upward*, aim from where the phone points,
-        /// and a nudge left or right from the swipe's horizontal component —
-        /// all of it decided by `TossController`, which this method only feeds
-        /// and obeys.
+        /// a nudge left or right from the swipe's horizontal component, and —
+        /// since Gate 4 — the ball's starting point from where the finger went
+        /// down. All of it is decided by `TossController`, which this method
+        /// only feeds and obeys.
         @objc
         private func handlePan(_ gesture: UIPanGestureRecognizer) {
             guard !isTornDown, let arView, podiumAnchor != nil else { return }
@@ -511,11 +563,19 @@ struct PodiumARViewContainer: UIViewRepresentable {
                 let started = swipeStart ?? now
                 swipeStart = nil
                 let translation = gesture.translation(in: arView)
+                // Where the finger went *down*: a pan's translation is measured
+                // from the touch-down point, so subtracting it from the current
+                // location recovers that point exactly — better than the
+                // location at `.began`, which UIKit only reports once the
+                // finger has already slid a few points (FR-004).
+                let current = gesture.location(in: arView)
+                let start = CGPoint(x: current.x - translation.x, y: current.y - translation.y)
                 throwBall(
                     TossController.Swipe(
                         translation: SIMD2(Float(translation.x), Float(translation.y)),
                         duration: now - started
                     ),
+                    from: start,
                     at: now
                 )
             case .cancelled, .failed:
@@ -525,15 +585,22 @@ struct PodiumARViewContainer: UIViewRepresentable {
             }
         }
 
-        private func throwBall(_ swipe: TossController.Swipe, at now: TimeInterval) {
+        private func throwBall(_ swipe: TossController.Swipe, from start: CGPoint, at now: TimeInterval) {
             guard let arView,
                   let anchor = podiumAnchor,
                   let frame = arView.session.currentFrame
             else { return }
 
             let camera = TossController.CameraBasis(transform: frame.camera.transform)
+            // `ARView.ray(through:)` owns the projection matrix and the
+            // interface orientation, so the touch point lands in the world
+            // correctly without this file having to know either. A nil result
+            // (no valid camera yet) falls back to the fixed spawn.
+            let touch = arView.ray(through: start).map {
+                TossController.TouchRay(origin: $0.origin, direction: $0.direction)
+            }
 
-            switch toss.flick(swipe, camera: camera, at: now) {
+            switch toss.flick(swipe, camera: camera, at: now, touch: touch) {
             case .rejected(.tooManyLiveBalls):
                 model.flash("Demasiadas pelotas en juego. Espera un momento.")
             case .rejected:
@@ -570,40 +637,163 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
         // MARK: - Scoring (FR-005, SC-002)
 
-        private func handleCupEntry(_ event: CollisionEvents.Began) {
-            guard !isTornDown else { return }
-            // One of the two entities is the trigger volume; the other is
-            // whatever crossed it. Only a ball we launched counts.
-            guard let ball = balls.first(where: { $0.entity === event.entityA || $0.entity === event.entityB })
-            else { return }
-            // False unless this is the ball's *first* crossing, so a ball that
-            // settles, rolls and re-triggers still scores exactly once.
-            guard toss.score(ball.id) else { return }
-            // False when the point counted for nobody — the round is paused —
-            // in which case there is nothing to celebrate.
-            guard model.registerScore() else { return }
+        /// A ball touched something. The +1 tier fires if that something was
+        /// part of the cup.
+        private func handleContact(_ event: CollisionEvents.Began) {
+            guard !isTornDown, !cupContactIDs.isEmpty else { return }
 
-            celebrate()
+            let hitCupWithA = cupContactIDs.contains(ObjectIdentifier(event.entityA))
+            let hitCupWithB = cupContactIDs.contains(ObjectIdentifier(event.entityB))
+            guard hitCupWithA != hitCupWithB else { return }
+            let other = hitCupWithA ? event.entityB : event.entityA
+
+            guard let ball = balls.first(where: { $0.entity === other }) else { return }
+            creditHit(ball.id)
         }
 
-        /// Success cue: the success haptic plus a quick swell of the trophy, so
-        /// the score reads even when the phone is at arm's length.
-        private func celebrate() {
+        /// The +1 tier: this ball touched the cup, wherever on it.
+        private func creditHit(_ ball: TossController.BallID) {
+            guard !isCupMoving else { return }
+            // nil unless this is the ball's *first* touch and it has not
+            // already been paid the make, which is worth the full amount.
+            guard let award = toss.registerHit(ball) else { return }
+            // False when the points counted for nobody — the round is paused —
+            // in which case there is nothing to acknowledge.
+            guard model.registerScore(award.points) else { return }
+
+            hitHaptics.impactOccurred(intensity: 0.55)
+            hitHaptics.prepare()
+            pulse(scale: 1.08, rise: 0.09, fall: 0.12)
+        }
+
+        /// The +10 tier: this ball is verifiably sitting in the cup.
+        private func creditMake(_ ball: TossController.BallID) {
+            guard !isCupMoving else { return }
+            guard let award = toss.registerMake(ball) else { return }
+            guard model.registerScore(award.points) else { return }
+
+            celebrateMake()
+        }
+
+        /// Success cue: the success haptic and a big swell of the trophy, so
+        /// the score reads even when the phone is at arm's length — followed by
+        /// the cup jumping to another step (US3).
+        ///
+        /// Scoring is suspended for the whole sequence. The trophy is being
+        /// scaled and then moved, so anything measured in the cup's frame
+        /// meanwhile is measured against a target that is not where it looks.
+        private func celebrateMake() {
             successHaptics.notificationOccurred(.success)
             successHaptics.prepare()
 
-            guard let trophy = podiumAnchor?.findEntity(named: PodiumBuilder.Name.trophy),
-                  let rest = trophyRestTransform
-            else { return }
+            isCupMoving = true
+            guard let trophy = trophyEntity else {
+                isCupMoving = false
+                return
+            }
 
-            var swollen = rest
-            swollen.scale = rest.scale * 1.28
-            _ = trophy.move(to: swollen, relativeTo: trophy.parent, duration: 0.14, timingFunction: .easeOut)
+            var swollen = trophyRestTransform
+            swollen.scale = trophyRestTransform.scale * 1.28
+            _ = trophy.move(
+                to: swollen,
+                relativeTo: trophy.parent,
+                duration: Self.makeSwellDuration,
+                timingFunction: .easeOut
+            )
 
             Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 150_000_000)
-                guard let self, !self.isTornDown, let rest = self.trophyRestTransform else { return }
-                _ = trophy.move(to: rest, relativeTo: trophy.parent, duration: 0.22, timingFunction: .easeInOut)
+                try? await Task.sleep(nanoseconds: UInt64(Self.makeSwellDuration * 1_000_000_000) + 10_000_000)
+                guard let self, !self.isTornDown else { return }
+                self.relocateCup()
+            }
+        }
+
+        // MARK: - Difficulty ramp (spec US3)
+
+        /// Slides the cup to a different podium step, so the next toss cannot
+        /// reuse the aim that just worked.
+        ///
+        /// The trophy is a child of the steps container, never of a step, so
+        /// this is one animation inside one parent — and the cup stays on the
+        /// podium's anchor, which is the anchor the balls are simulated on.
+        /// The move doubles as the return from the celebratory swell.
+        private func relocateCup() {
+            guard !isTornDown, let trophy = trophyEntity else {
+                isCupMoving = false
+                return
+            }
+
+            // A ball lying in the cup would be left hanging in the air when the
+            // cup slides out from under it. It has already been paid, so it
+            // leaves with the cup.
+            clearBallsInsideCup()
+
+            currentStep = PodiumBuilder.nextStep(after: currentStep)
+            let destination = trophyRestTransform
+            _ = trophy.move(
+                to: destination,
+                relativeTo: trophy.parent,
+                duration: Self.cupMoveDuration,
+                timingFunction: .easeInOut
+            )
+
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(Self.cupMoveDuration * 1_000_000_000) + 30_000_000)
+                guard let self, !self.isTornDown else { return }
+                // Land exactly on the target pose rather than wherever the
+                // animation stopped, so the next swell has a clean rest state.
+                self.trophyEntity?.transform = self.trophyRestTransform
+                self.isCupMoving = false
+            }
+        }
+
+        /// The trophy's pose when nothing is animating: upright, unscaled, on
+        /// whichever step the cup currently belongs to.
+        private var trophyRestTransform: Transform {
+            Transform(
+                scale: .one,
+                rotation: simd_quatf(angle: 0, axis: [0, 1, 0]),
+                translation: currentStep.trophyPosition
+            )
+        }
+
+        private func clearBallsInsideCup() {
+            guard cupEntity != nil else { return }
+            var survivors: [LiveBall] = []
+            for ball in balls {
+                guard let placement = cupPlacement(of: ball.entity),
+                      toss.isInsideCup(placement, ballRadius: toss.tuning.ballRadius)
+                else {
+                    survivors.append(ball)
+                    continue
+                }
+                ball.entity.removeFromParent()
+                toss.retire(ball.id)
+            }
+            balls = survivors
+        }
+
+        /// A short swell of the trophy, used as the light cue for the +1 tier.
+        /// Skipped while a make is being celebrated — that animation owns the
+        /// trophy.
+        private func pulse(scale: Float, rise: TimeInterval, fall: TimeInterval) {
+            guard !isCupMoving, let trophy = trophyEntity else { return }
+            let rest = trophyRestTransform
+            var swollen = rest
+            swollen.scale = rest.scale * scale
+            _ = trophy.move(to: swollen, relativeTo: trophy.parent, duration: rise, timingFunction: .easeOut)
+
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(rise * 1_000_000_000) + 10_000_000)
+                guard let self, !self.isTornDown, !self.isCupMoving,
+                      let trophy = self.trophyEntity
+                else { return }
+                _ = trophy.move(
+                    to: self.trophyRestTransform,
+                    relativeTo: trophy.parent,
+                    duration: fall,
+                    timingFunction: .easeInOut
+                )
             }
         }
 
@@ -630,6 +820,10 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
             var survivors: [LiveBall] = []
             survivors.reserveCapacity(balls.count)
+            // Collected rather than credited on the spot: a make relocates the
+            // cup, which culls balls, and that must not happen underneath this
+            // loop's own rebuild of `balls`.
+            var landed: [TossController.BallID] = []
 
             for var ball in balls {
                 ball.age += deltaTime
@@ -640,6 +834,23 @@ struct PodiumARViewContainer: UIViewRepresentable {
                     delta: deltaTime
                 )
                 let height = ball.entity.position(relativeTo: anchor).y
+                let placement = cupPlacement(of: ball.entity)
+
+                // FR-005 / SC-002: the make is a geometric fact that has to
+                // hold for `insideDwell` seconds, not a sensor contact. A ball
+                // punched through the wall or skimming past crosses the
+                // interior in a frame or two and never gets there.
+                let inside = !isCupMoving && placement.map {
+                    toss.isInsideCup($0, ballRadius: toss.tuning.ballRadius)
+                } ?? false
+                ball.insideFor = toss.containedDuration(
+                    previous: ball.insideFor,
+                    isInside: inside,
+                    delta: deltaTime
+                )
+                if toss.hasSettledInside(containedFor: ball.insideFor), !toss.hasMade(ball.id) {
+                    landed.append(ball.id)
+                }
 
                 let reason = toss.cullReason(
                     age: ball.age,
@@ -654,7 +865,12 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
                 if reason != .outOfBounds,
                    toss.mayNudgeOffRim(nudgesSoFar: ball.rimNudges),
-                   isPerchedOnRim(ball.entity) {
+                   let placement,
+                   toss.isPerchedOnRim(
+                       placement,
+                       ballRadius: toss.tuning.ballRadius,
+                       cupOuterRadius: PodiumBuilder.Metrics.cupRimOuterRadius
+                   ) {
                     nudgeOffRim(ball.entity)
                     ball.rimNudges += 1
                     ball.restingFor = 0
@@ -668,24 +884,19 @@ struct PodiumARViewContainer: UIViewRepresentable {
             }
 
             balls = survivors
+            for ball in landed {
+                creditMake(ball)
+            }
         }
 
-        // MARK: - Rim rescue (Gate 3 row 3.2)
+        // MARK: - Where a ball is relative to the cup
 
-        /// Is this ball balanced on the cup's rim right now? Measured in the
-        /// cup's own frame, where `TossController`'s rule is written.
-        private func isPerchedOnRim(_ ball: ModelEntity) -> Bool {
-            guard let cup = cupEntity else { return false }
-            let local = ball.position(relativeTo: cup)
-            let contact = TossController.RimContact(
-                heightAboveRim: local.y - PodiumBuilder.Metrics.cupRimHeight,
-                radialDistance: simd_length(SIMD2(local.x, local.z))
-            )
-            return toss.isPerchedOnRim(
-                contact,
-                ballRadius: toss.tuning.ballRadius,
-                cupOuterRadius: PodiumBuilder.Metrics.cupRimOuterRadius
-            )
+        /// The ball's position in the cup's own frame, in the shape both cup
+        /// rules — inside (FR-005) and perched on the rim (Gate 3 row 3.2) —
+        /// are written against. `nil` before the podium is placed.
+        private func cupPlacement(of ball: ModelEntity) -> TossController.CupPlacement? {
+            guard let cup = cupEntity else { return nil }
+            return PodiumBuilder.cupPlacement(ofBallAt: ball.position(relativeTo: cup))
         }
 
         /// Tips a perched ball off the rim in a random direction, so it falls
@@ -799,12 +1010,14 @@ struct PodiumARViewContainer: UIViewRepresentable {
             lifecycleObservers.removeAll()
 
             subscriptions.removeAll()
-            cupSubscription = nil
+            contactSubscription = nil
+            cupContactIDs = []
 
             balls.removeAll()
             toss.retireAll()
-            trophyRestTransform = nil
+            trophyEntity = nil
             cupEntity = nil
+            isCupMoving = false
             swipeStart = nil
 
             coachingOverlay.delegate = nil

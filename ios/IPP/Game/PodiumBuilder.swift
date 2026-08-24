@@ -35,7 +35,6 @@ enum PodiumBuilder {
         static let cup = "cup"
         static let cupWall = "cup_wall"
         static let cupFloor = "cup_floor"
-        static let cupTrigger = "cup_trigger"
         static let floor = "floor"
         /// Balls are named `ball_<id>` so a scene dump stays readable; the game
         /// itself matches them by identity, not by name.
@@ -124,6 +123,70 @@ enum PodiumBuilder {
         }
     }
 
+    // MARK: - Steps as a value (spec US3)
+
+    /// The three podium steps, as something the difficulty ramp can reason
+    /// about without touching the scene graph.
+    ///
+    /// The trophy hangs off the **steps container**, not off a step, precisely
+    /// so relocation is one `move(to:relativeTo:)` inside a single parent
+    /// rather than a re-parent mid-animation — and so it never leaves the
+    /// podium's anchor, which is the anchor the balls are simulated on.
+    enum Step: String, CaseIterable {
+        case gold
+        case silver
+        case bronze
+
+        var entityName: String {
+            switch self {
+            case .gold: return Name.goldStep
+            case .silver: return Name.silverStep
+            case .bronze: return Name.bronzeStep
+            }
+        }
+
+        var height: Float {
+            switch self {
+            case .gold: return Metrics.goldHeight
+            case .silver: return Metrics.silverHeight
+            case .bronze: return Metrics.bronzeHeight
+            }
+        }
+
+        var x: Float {
+            switch self {
+            case .gold: return Metrics.goldX
+            case .silver: return Metrics.silverX
+            case .bronze: return Metrics.bronzeX
+            }
+        }
+
+        /// Where the trophy stands when it is on this step, in the steps
+        /// container's frame: centred on the step's top face.
+        var trophyPosition: SIMD3<Float> { [x, height, 0] }
+    }
+
+    /// Picks the step the cup jumps to after a make (spec US3: "consecutive
+    /// scores require re-aiming").
+    ///
+    /// It **cannot** return the step the cup is already on — that one is
+    /// removed from the pool before the draw rather than being re-rolled away,
+    /// so there is no unlucky path where the cup stays put.
+    static func nextStep<G: RandomNumberGenerator>(
+        after current: Step,
+        using generator: inout G
+    ) -> Step {
+        let others = Step.allCases.filter { $0 != current }
+        // `others` always has two elements, so the fallback is unreachable.
+        return others.randomElement(using: &generator) ?? current
+    }
+
+    /// ``nextStep(after:using:)`` with the system generator.
+    static func nextStep(after current: Step) -> Step {
+        var generator = SystemRandomNumberGenerator()
+        return nextStep(after: current, using: &generator)
+    }
+
     // MARK: - Colors
     //
     // The exact `LeaderboardRow.medalColor` values, so the podium reads as the
@@ -157,13 +220,14 @@ enum PodiumBuilder {
         let podium = Entity()
         podium.name = Name.steps
 
-        let gold = makeStep(
-            name: Name.goldStep,
-            color: Medal.gold,
-            height: Metrics.goldHeight,
-            x: Metrics.goldX
+        podium.addChild(
+            makeStep(
+                name: Name.goldStep,
+                color: Medal.gold,
+                height: Metrics.goldHeight,
+                x: Metrics.goldX
+            )
         )
-        podium.addChild(gold)
         podium.addChild(
             makeStep(
                 name: Name.silverStep,
@@ -181,12 +245,14 @@ enum PodiumBuilder {
             )
         )
 
-        // The trophy rides on the gold step, so Phase 5's cup relocation is a
-        // re-parent plus a move rather than a rebuild. The step's origin is its
-        // centre, so half its height puts the trophy on the top face.
+        // The trophy starts on the gold step but hangs off the steps container
+        // rather than off the step itself, so the difficulty ramp (US3) can
+        // slide it to another step with a single `move(to:relativeTo:)` in a
+        // parent that never changes — and never leaves the podium's anchor,
+        // which is the anchor the balls' physics runs on.
         let trophy = makeTrophy()
-        trophy.position = [0, Metrics.goldHeight / 2, 0]
-        gold.addChild(trophy)
+        trophy.position = Step.gold.trophyPosition
+        podium.addChild(trophy)
 
         return podium
     }
@@ -213,12 +279,14 @@ enum PodiumBuilder {
         return step
     }
 
-    /// The trophy: base + stem + an **open** cup with an invisible trigger
-    /// volume filling its mouth.
+    /// The trophy: base + stem + an **open** cup.
     ///
     /// The cup is a ring of wall segments over a floor disc rather than a solid
     /// cylinder on purpose — a solid mesh would make the ball bounce off the
-    /// target instead of settling into it, which is what Phase 3 has to detect.
+    /// target instead of settling into it, which is what the scoring rule has
+    /// to detect. Nothing here is a sensor: whether a ball is inside the cup is
+    /// decided from its position (``cupPlacement(ofBallAt:)``), not from a
+    /// contact.
     static func makeTrophy() -> Entity {
         let trophy = Entity()
         trophy.name = Name.trophy
@@ -353,30 +421,26 @@ enum PodiumBuilder {
             cup.addChild(segment)
         }
 
-        cup.addChild(makeCupTrigger())
         return cup
     }
 
-    /// Invisible sensor filling the inside of the cup. It carries no
-    /// `ModelComponent`, so it is never drawn; Phase 3 subscribes to its
-    /// `CollisionEvents` to score a ball.
-    static func makeCupTrigger() -> Entity {
-        // Shorter than the wall so a ball perched on the rim does not count,
-        // and narrower so the sensor stays clear of the wall segments — which
-        // now lean *inward* at their base, so the clearance is measured there.
-        let height = Metrics.cupWallHeight * 0.75
-        let side = (Metrics.cupInnerRadius - Metrics.cupWallThickness) * 1.25
-        let trigger = Entity()
-        trigger.name = Name.cupTrigger
-        trigger.position = [0, Metrics.cupFloorThickness + height / 2, 0]
-        trigger.components.set(
-            CollisionComponent(
-                shapes: [.generateBox(width: side, height: height, depth: side)],
-                mode: .trigger,
-                filter: .sensor
-            )
+    /// A ball's position in the cup's own frame, described the way
+    /// `TossController`'s cup rules want it (Gate 4 DEFECT).
+    ///
+    /// This is the single bridge between the geometry above and the scoring
+    /// rules: the AR side measures the ball's centre relative to the cup entity
+    /// and hands the result straight to ``TossController/isInsideCup(_:ballRadius:)``
+    /// and ``TossController/isPerchedOnRim(_:ballRadius:cupOuterRadius:)``.
+    /// There is no sensor volume any more — Phase 5 deleted it, because contact
+    /// with a sensor cannot tell which side of the wall the ball is on, which
+    /// is exactly what Gate 4 caught.
+    static func cupPlacement(ofBallAt centre: SIMD3<Float>) -> TossController.CupPlacement {
+        TossController.CupPlacement(
+            heightAboveRim: centre.y - Metrics.cupRimHeight,
+            radialDistance: simd_length(SIMD2(centre.x, centre.z)),
+            heightAboveCupFloor: centre.y - Metrics.cupFloorThickness,
+            interiorRadius: Metrics.cupInnerRadius(atHeight: centre.y)
         )
-        return trigger
     }
 
     /// Invisible static plane at anchor height (y = 0) standing in for the real
@@ -616,9 +680,15 @@ extension PodiumBuilder {
             }
         }
 
-        // 2. Trophy on the tallest (gold) step, not loose in the scene.
-        if let trophy = requireEntity(Name.trophy), trophy.parent?.name != Name.goldStep {
-            problems.append("trophy is not parented to the gold step")
+        // 2. Trophy standing on the tallest (gold) step, hanging off the steps
+        //    container so the ramp can slide it between steps (US3).
+        if let trophy = requireEntity(Name.trophy) {
+            if trophy.parent?.name != Name.steps {
+                problems.append("trophy is not parented to the steps container")
+            }
+            if simd_distance(trophy.position, Step.gold.trophyPosition) > 0.0001 {
+                problems.append("trophy does not start on the gold step's top face")
+            }
         }
 
         // 3. Cup: a closed ring of wall segments over a floor disc.
@@ -639,21 +709,39 @@ extension PodiumBuilder {
             requireStaticBody(segment, segment.name)
         }
 
-        // 4. Trigger volume: collidable, invisible, in trigger mode.
-        if let trigger = requireEntity(Name.cupTrigger) {
-            requireCollision(trigger, Name.cupTrigger)
-            if trigger.components[ModelComponent.self] != nil {
-                problems.append("cup trigger is visible — it must have no ModelComponent")
+        // 4. The scoring rule against the real geometry (Gate 4 DEFECT): a ball
+        //    resting on the cup floor must read as inside, and a ball touching
+        //    the *outside* of the wall must never read as inside, at any height
+        //    — including the low front, which is where the false positives came
+        //    from.
+        let toss = TossController()
+        let ballRadius = toss.tuning.ballRadius
+        let restingCentre = SIMD3<Float>(0, Metrics.cupFloorThickness + ballRadius, 0)
+        if !toss.isInsideCup(cupPlacement(ofBallAt: restingCentre), ballRadius: ballRadius) {
+            problems.append("a ball resting on the cup floor does not register as inside")
+        }
+        for step in 0...12 {
+            let height = Float(step) / 12 * Metrics.cupRimHeight
+            // Centre of a ball pressed against the outer face of the wall.
+            let outside = SIMD3<Float>(
+                Metrics.cupInnerRadius(atHeight: height) + Metrics.cupWallThickness + ballRadius,
+                height,
+                0
+            )
+            if toss.isInsideCup(cupPlacement(ofBallAt: outside), ballRadius: ballRadius) {
+                problems.append(
+                    "a ball touching the cup's outside at \(height) m reads as inside"
+                )
             }
-            if trigger.components[CollisionComponent.self]?.mode != .trigger {
-                problems.append("cup trigger is not in .trigger mode")
-            }
+        }
+        // A ball perched on the rim is neither inside nor allowed to score.
+        let perched = SIMD3<Float>(Metrics.cupRimRingRadius, Metrics.cupRimHeight + ballRadius, 0)
+        if toss.isInsideCup(cupPlacement(ofBallAt: perched), ballRadius: ballRadius) {
+            problems.append("a ball perched on the rim reads as inside")
         }
 
         // 4b. Cup geometry after the Gate 3 rim fix: the wall must flare
-        //     outward, still admit the ball at the bottom, and keep the scoring
-        //     trigger strictly below the rim so a perched ball cannot score.
-        let ballRadius = TossController.Tuning().ballRadius
+        //     outward and still admit the ball at the bottom.
         let mouthRadius = Metrics.cupInnerRadius(atHeight: Metrics.cupRimHeight)
         let baseRadius = Metrics.cupInnerRadius(atHeight: Metrics.cupFloorThickness)
         if mouthRadius <= baseRadius {
@@ -662,12 +750,6 @@ extension PodiumBuilder {
         let restingHeight = Metrics.cupFloorThickness + ballRadius
         if Metrics.cupInnerRadius(atHeight: restingHeight) <= ballRadius {
             problems.append("the flared wall is too tight for a ball to reach the cup floor")
-        }
-        if let trigger = scene.findEntity(named: Name.cupTrigger) {
-            let triggerTop = trigger.position.y + Metrics.cupWallHeight * 0.75 / 2
-            if triggerTop >= Metrics.cupRimHeight {
-                problems.append("the scoring trigger reaches the rim — a perched ball could score")
-            }
         }
 
         // 5. Floor plane: invisible, static, top face at the anchor height.

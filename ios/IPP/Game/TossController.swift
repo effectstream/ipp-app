@@ -77,6 +77,19 @@ import simd
 ///
 /// ``Tuning/fastFlick`` also came down 2400 → 2200 pt/s so the ceiling is
 /// actually reachable by a thumb rather than being a number in a file.
+///
+/// # Scoring (Gate 4 → Phase 5)
+///
+/// Two tiers, and the second absorbs the first: touching the cup anywhere pays
+/// ``Tuning/hitPoints``, landing inside pays ``Tuning/makePoints`` *in total*.
+/// See ``registerHit(_:)`` and ``registerMake(_:)``.
+///
+/// "Inside" is a geometric fact about where the ball's centre is
+/// (``isInsideCup(_:ballRadius:)``) that has to hold for
+/// ``Tuning/insideDwell`` seconds — not a sensor contact. Gate 4 found the
+/// contact version awarding makes for balls that only hit the cup's front from
+/// the outside; a rule written about the centre of the ball cannot be satisfied
+/// from outside the wall at all.
 struct TossController {
 
     // MARK: - Tuning
@@ -137,14 +150,72 @@ struct TossController {
         /// Keeps a diagonal flick a nudge rather than a right-angle turn.
         var maxLateral: Float = 0.35
 
-        // Spawn point — just in front of the camera, not inside it.
+        // Spawn point — just in front of the camera, under the finger.
 
         /// Metres in front of the camera the ball appears at, so it is outside
-        /// the near plane and visibly leaves the player's hand.
+        /// the near plane and visibly leaves the player's hand. With a touch
+        /// point this is the *depth* of the spawn plane; the sideways and
+        /// vertical position come from where the finger went down (FR-004,
+        /// amended at Gate 4).
         var spawnForwardOffset: Float = 0.16
-        /// Metres below the camera the ball appears at, so it arcs up into view
+        /// Metres below the camera the ball appears at when there is no touch
+        /// point to anchor it to (fallback only), so it arcs up into view
         /// rather than starting dead centre over the crosshair.
         var spawnDownOffset: Float = 0.04
+        /// Smallest angle-cosine between the touch ray and the aim that is
+        /// still treated as "in front of the camera". A ray flatter than this
+        /// (a bad projection, a touch beyond the frustum) is pulled back in
+        /// rather than spawning the ball beside or behind the player.
+        var minimumSpawnCosine: Float = 0.30
+        /// Hard cap on how far from the camera's aim axis a touch-anchored
+        /// spawn may sit, in metres. A corner touch on a wide lens projects to
+        /// ~0.15 m at the spawn depth; the cap keeps a freak projection from
+        /// putting the ball an arm's length off to the side.
+        var maxSpawnLateral: Float = 0.18
+        /// Bounds on the spawn's depth in front of the camera, in metres. The
+        /// lower bound keeps the ball out of the near plane (and out of the
+        /// player's own hand); the upper bound keeps it from being pushed into
+        /// whatever the player is standing at.
+        var minSpawnDepth: Float = 0.10
+        var maxSpawnDepth: Float = 0.30
+
+        // Scoring (FR-005, amended at Gate 4: two tiers).
+
+        /// Points for touching the cup anywhere — outside included. Once per
+        /// ball.
+        var hitPoints: Int = 1
+        /// Points for a ball that lands *inside* the cup. Once per ball, and it
+        /// **absorbs** the hit: a made ball is worth `makePoints` in total, so
+        /// if the hit already paid out, the make only adds the difference.
+        var makePoints: Int = 10
+
+        // "Inside the cup", as a geometric fact rather than a sensor contact
+        // (Gate 4 DEFECT: hits on the cup's front were scoring as makes).
+
+        /// How far *below* the rim, as a fraction of the ball's radius, the
+        /// ball's centre must be before it counts as inside the cup.
+        ///
+        /// Deliberately the same number as ``rimGraceFraction``, which makes
+        /// the two classifications exact complements on the height axis: a ball
+        /// is either low enough to be inside or high enough to be perched, never
+        /// both. A ball resting on the cup floor sits ≈ 0.7 radii below the rim,
+        /// so there is ≈ 1 cm of margin.
+        var insideDepthFraction: Float = 0.40
+        /// Slack, in metres, on the "the whole ball fits inside the wall"
+        /// radial test. The wall is a 12-gon, so its corners sit ~3.5 % further
+        /// out than the nominal inner radius and a ball can settle a couple of
+        /// millimetres past it.
+        var insideRadialTolerance: Float = 0.004
+        /// How long a ball has to stay geometrically inside the cup before the
+        /// make is credited, in seconds.
+        ///
+        /// This is what separates *landing* in the cup from *passing through*
+        /// it. The region where a ball counts as inside is only ~4 cm across,
+        /// so anything still travelling leaves it again within a frame or two;
+        /// a ball that has actually come to rest in the cup holds it forever.
+        /// 0.10 s is six frames at 60 Hz — imperceptible as a delay, decisive
+        /// as a filter.
+        var insideDwell: TimeInterval = 0.10
 
         // Flood control (FR-006, edge case "ball spam").
 
@@ -245,6 +316,27 @@ struct TossController {
         }
     }
 
+    /// A screen touch turned into a world-space ray by the AR view.
+    ///
+    /// The AR side gets this from `ARView.ray(through:)`, which knows the real
+    /// projection matrix and the interface orientation; this type only decides
+    /// *where along it* the ball appears. Keeping the ray as the input is what
+    /// lets the spawn maths be tested without an `ARView` — and what keeps the
+    /// orientation question out of this file entirely.
+    struct TouchRay: Equatable {
+        /// World-space start of the ray (the camera, give or take the near
+        /// plane).
+        var origin: SIMD3<Float>
+        /// World-space direction through the touched point. Need not be unit
+        /// length.
+        var direction: SIMD3<Float>
+
+        init(origin: SIMD3<Float>, direction: SIMD3<Float>) {
+            self.origin = origin
+            self.direction = direction
+        }
+    }
+
     /// Everything the AR side needs to put one ball into the scene.
     struct Launch: Equatable {
         var ball: BallID
@@ -272,6 +364,32 @@ struct TossController {
         case rejected(Rejection)
     }
 
+    /// The two ways a ball can be worth points (FR-005, amended at Gate 4).
+    enum ScoreTier: Equatable {
+        /// The ball touched the cup — anywhere, inside or out.
+        case hit
+        /// The ball came to rest inside the cup.
+        case make
+    }
+
+    /// A tier that has just been earned, and what it actually pays.
+    ///
+    /// ``points`` is not the tier's face value: the make **absorbs** the hit,
+    /// so a ball that has already been paid its `hitPoints` collects only the
+    /// remainder when it drops in. A made ball is worth `makePoints` in total,
+    /// never `makePoints + hitPoints`.
+    struct Award: Equatable {
+        var ball: BallID
+        var tier: ScoreTier
+        var points: Int
+
+        init(ball: BallID, tier: ScoreTier, points: Int) {
+            self.ball = ball
+            self.tier = tier
+            self.points = points
+        }
+    }
+
     /// Why a ball is being taken out of the scene.
     enum CullReason: Equatable {
         /// It has been motionless long enough to be litter.
@@ -288,9 +406,12 @@ struct TossController {
 
     /// Balls currently simulating, newest last.
     private(set) var liveBalls: [BallID] = []
-    /// Balls that have already been credited. Cleared per ball on ``retire(_:)``
-    /// — ids are never reused, so nothing can be double-credited afterwards.
-    private var scoredBalls: Set<BallID> = []
+    /// Balls that have already been paid the hit tier. Cleared per ball on
+    /// ``retire(_:)`` — ids are never reused, so nothing can be double-credited
+    /// afterwards.
+    private var hitBalls: Set<BallID> = []
+    /// Balls that have already been paid the make tier.
+    private var madeBalls: Set<BallID> = []
     private var lastLaunch: TimeInterval?
     private var nextBall: BallID = 1
 
@@ -300,7 +421,14 @@ struct TossController {
 
     var liveBallCount: Int { liveBalls.count }
 
-    func hasScored(_ ball: BallID) -> Bool { scoredBalls.contains(ball) }
+    /// Has this ball already been paid for touching the cup?
+    func hasHit(_ ball: BallID) -> Bool { hitBalls.contains(ball) }
+
+    /// Has this ball already been paid for landing in the cup?
+    func hasMade(_ ball: BallID) -> Bool { madeBalls.contains(ball) }
+
+    /// Has this ball earned anything at all?
+    func hasScored(_ ball: BallID) -> Bool { hasHit(ball) || hasMade(ball) }
 
     func isLive(_ ball: BallID) -> Bool { liveBalls.contains(ball) }
 
@@ -340,13 +468,54 @@ struct TossController {
         return min(max(raw, -tuning.maxLateral), tuning.maxLateral)
     }
 
-    /// Where the ball leaves from: just in front of and slightly below the
-    /// camera, so it is outside the near plane and reads as leaving the hand.
+    /// Where the ball leaves from when there is no touch to anchor it to: just
+    /// in front of and slightly below the camera, so it is outside the near
+    /// plane and reads as leaving the hand.
     func launchOrigin(camera: CameraBasis) -> SIMD3<Float> {
         let aim = Self.unit(camera.forward, fallback: Self.defaultForward)
         return camera.position
             + aim * tuning.spawnForwardOffset
             - Self.worldUp * tuning.spawnDownOffset
+    }
+
+    /// Where the ball leaves from: **under the finger** (FR-004, amended at
+    /// Gate 4).
+    ///
+    /// The ray is the touch-down point projected into the world by the AR view.
+    /// The ball is placed where that ray crosses the plane
+    /// ``Tuning/spawnForwardOffset`` in front of the camera, so the depth is
+    /// the same wherever the player touches and only the sideways/vertical
+    /// position follows the finger — which is exactly "the ball departs from
+    /// under my thumb" without also making corner throws start further away.
+    ///
+    /// Two clamps keep the result sane, whatever the projection hands over:
+    /// the ray's angle off the aim is capped (``Tuning/minimumSpawnCosine``) so
+    /// the spawn is always *in front of* the camera, and the final point is
+    /// clamped in depth (``Tuning/minSpawnDepth``…``Tuning/maxSpawnDepth``) and
+    /// in sideways offset (``Tuning/maxSpawnLateral``) so the ball cannot
+    /// appear inside the near plane or an arm's length off to one side.
+    ///
+    /// Passing `nil` falls back to the fixed spawn above.
+    func launchOrigin(camera: CameraBasis, touch: TouchRay?) -> SIMD3<Float> {
+        guard let touch else { return launchOrigin(camera: camera) }
+
+        let aim = Self.unit(camera.forward, fallback: Self.defaultForward)
+        let direction = Self.unit(touch.direction, fallback: aim)
+        let cosine = max(simd_dot(direction, aim), tuning.minimumSpawnCosine)
+        let projected = touch.origin + direction * (tuning.spawnForwardOffset / cosine)
+
+        // Re-express around the camera so depth and sideways offset can be
+        // clamped independently.
+        let relative = projected - camera.position
+        let depth = simd_dot(relative, aim)
+        let lateral = relative - aim * depth
+        let lateralLength = simd_length(lateral)
+        let cappedLateral = lateralLength > tuning.maxSpawnLateral && lateralLength > 0
+            ? lateral * (tuning.maxSpawnLateral / lateralLength)
+            : lateral
+        let cappedDepth = min(max(depth, tuning.minSpawnDepth), tuning.maxSpawnDepth)
+
+        return camera.position + aim * cappedDepth + cappedLateral
     }
 
     /// World-space launch velocity: the camera's aim, lofted by ``Tuning/arc``
@@ -384,7 +553,15 @@ struct TossController {
     ///
     /// On success the new ball is recorded as live; the caller is responsible
     /// for calling ``retire(_:)`` when it removes the entity again.
-    mutating func flick(_ swipe: Swipe, camera: CameraBasis, at now: TimeInterval) -> Outcome {
+    /// - Parameter touch: the swipe's *starting* point, projected into the
+    ///   world by the AR view. The ball spawns under it; `nil` falls back to
+    ///   the fixed in-front-of-the-camera spawn.
+    mutating func flick(
+        _ swipe: Swipe,
+        camera: CameraBasis,
+        at now: TimeInterval,
+        touch: TouchRay? = nil
+    ) -> Outcome {
         guard isToss(swipe) else { return .rejected(.notAToss) }
         if let blocker = launchBlocker(at: now) { return .rejected(blocker) }
 
@@ -397,24 +574,44 @@ struct TossController {
         return .launched(
             Launch(
                 ball: ball,
-                origin: launchOrigin(camera: camera),
+                origin: launchOrigin(camera: camera, touch: touch),
                 velocity: velocity,
                 impulse: velocity * tuning.ballMass
             )
         )
     }
 
-    // MARK: - Scoring (SC-002)
+    // MARK: - Scoring (FR-005, SC-002)
+    //
+    // Two tiers, each paid at most once per ball, and the make absorbs the hit.
+    // Both are gated on the ball still being live, so a late event about a
+    // culled ball can never resurrect it.
 
-    /// Credits a ball for landing in the cup.
+    /// Credits a ball for touching the cup — the +1 tier, anywhere on the cup,
+    /// outside included.
     ///
-    /// Returns `true` **exactly once** per ball: the cup's trigger volume fires
-    /// a collision every time the ball crosses it — settling, bouncing, rolling
-    /// — and only the first of those is a point. A ball that has already been
-    /// retired scores nothing, so a late event cannot resurrect it.
-    mutating func score(_ ball: BallID) -> Bool {
-        guard liveBalls.contains(ball) else { return false }
-        return scoredBalls.insert(ball).inserted
+    /// Returns the award **exactly once** per ball: a thrown ball rattles round
+    /// the wall segments and fires a contact for each of them, and only the
+    /// first is worth anything. A ball that has already been paid the make
+    /// earns nothing more, so the order the two tiers arrive in does not change
+    /// the total.
+    mutating func registerHit(_ ball: BallID) -> Award? {
+        guard liveBalls.contains(ball), !madeBalls.contains(ball) else { return nil }
+        guard hitBalls.insert(ball).inserted else { return nil }
+        return Award(ball: ball, tier: .hit, points: tuning.hitPoints)
+    }
+
+    /// Credits a ball for landing inside the cup — the +10 tier.
+    ///
+    /// The payout is `makePoints` minus whatever the hit tier already paid for
+    /// the same ball, so a made ball is worth 10 in total rather than 11. The
+    /// caller decides *that* the ball is inside (see ``isInsideCup(_:ballRadius:)``
+    /// and ``hasSettledInside(containedFor:)``); this only handles the money.
+    mutating func registerMake(_ ball: BallID) -> Award? {
+        guard liveBalls.contains(ball) else { return nil }
+        guard madeBalls.insert(ball).inserted else { return nil }
+        let alreadyPaid = hitBalls.contains(ball) ? tuning.hitPoints : 0
+        return Award(ball: ball, tier: .make, points: tuning.makePoints - alreadyPaid)
     }
 
     // MARK: - Culling (FR-006)
@@ -439,22 +636,93 @@ struct TossController {
         return nil
     }
 
-    // MARK: - Rim rescue (Gate 3 row 3.2)
+    // MARK: - Where the ball is relative to the cup
 
-    /// Where a ball sits relative to the cup, reduced to the two numbers the
-    /// rim rule needs. Both are measured in the cup's own frame.
-    struct RimContact: Equatable {
+    /// One ball's position in the cup's own frame, reduced to the four numbers
+    /// the two cup rules need. The AR side measures these off the real
+    /// entities; every rule below is arithmetic over them.
+    struct CupPlacement: Equatable {
         /// Ball centre minus the top of the cup wall, in metres. Positive means
         /// the ball is above the mouth.
         var heightAboveRim: Float
         /// Horizontal distance from the cup's axis, in metres.
         var radialDistance: Float
+        /// Ball centre minus the inner surface of the cup's floor disc, in
+        /// metres. Negative means the ball is below the cup altogether — on the
+        /// step, on the stem, on the table.
+        var heightAboveCupFloor: Float
+        /// Inner radius of the flared wall **at the ball's own height**, in
+        /// metres. Widest at the mouth, narrowest at the floor.
+        var interiorRadius: Float
 
-        init(heightAboveRim: Float, radialDistance: Float) {
+        init(
+            heightAboveRim: Float,
+            radialDistance: Float,
+            heightAboveCupFloor: Float = 0,
+            interiorRadius: Float = 0
+        ) {
             self.heightAboveRim = heightAboveRim
             self.radialDistance = radialDistance
+            self.heightAboveCupFloor = heightAboveCupFloor
+            self.interiorRadius = interiorRadius
         }
     }
+
+    // MARK: - Inside the cup (Gate 4 DEFECT, SC-002)
+
+    /// Is the ball **genuinely inside the cup** right now?
+    ///
+    /// Gate 4 found makes being awarded for balls that only hit the cup's front
+    /// wall from the outside. The cause was structural: a sensor volume fires
+    /// on *contact*, and contact says nothing about which side of the wall the
+    /// ball is on. This rule says it directly, and cannot be fooled from the
+    /// outside, because it is a statement about the ball's centre rather than
+    /// about a touch:
+    ///
+    /// 1. the centre is at least ``Tuning/insideDepthFraction`` of a radius
+    ///    **below the rim** — a ball leaning on the outside of the wall at
+    ///    mouth height is above it, a ball perched on the rim is a full radius
+    ///    above it;
+    /// 2. the centre is **above the cup's floor**, which rules out everything
+    ///    hanging under the mouth (the stem, the gold step, the table);
+    /// 3. the **whole ball** fits within the wall at that height — the centre
+    ///    is within `interiorRadius − ballRadius` of the axis, plus a few
+    ///    millimetres for the 12-gon's corners.
+    ///
+    /// Rule 3 is the one that kills the defect outright: a ball touching the
+    /// outside of the wall has its centre a full radius *beyond* the wall,
+    /// around 9 cm from the axis, where the test allows about 2.
+    ///
+    /// This is a snapshot, so it is also true for the single frame a ball
+    /// spends crossing the cup's middle. ``hasSettledInside(containedFor:)``
+    /// is the other half: the ball has to *stay* inside.
+    func isInsideCup(_ placement: CupPlacement, ballRadius: Float) -> Bool {
+        guard placement.heightAboveRim <= -ballRadius * tuning.insideDepthFraction else {
+            return false
+        }
+        guard placement.heightAboveCupFloor >= 0 else { return false }
+        let clearance = max(placement.interiorRadius - ballRadius, 0) + tuning.insideRadialTolerance
+        return placement.radialDistance <= clearance
+    }
+
+    /// Runs the "how long has this ball been inside the cup" accumulator, in
+    /// the same shape as ``restingDuration(previous:speed:delta:)``: it adds up
+    /// while the ball is inside and resets the instant it is not.
+    func containedDuration(
+        previous: TimeInterval,
+        isInside: Bool,
+        delta: TimeInterval
+    ) -> TimeInterval {
+        isInside ? previous + delta : 0
+    }
+
+    /// Has the ball been inside long enough to call it a landing rather than a
+    /// fly-through? See ``Tuning/insideDwell``.
+    func hasSettledInside(containedFor: TimeInterval) -> Bool {
+        containedFor >= tuning.insideDwell
+    }
+
+    // MARK: - Rim rescue (Gate 3 row 3.2)
 
     /// Is this ball balanced on the cup's rim, rather than resting inside the
     /// cup or somewhere else in the scene?
@@ -465,12 +733,12 @@ struct TossController {
     /// has its centre below the rim, a ball on the rim has it a radius above —
     /// so the caller can shove the perched one instead of deleting it.
     func isPerchedOnRim(
-        _ contact: RimContact,
+        _ placement: CupPlacement,
         ballRadius: Float,
         cupOuterRadius: Float
     ) -> Bool {
-        contact.heightAboveRim > -ballRadius * tuning.rimGraceFraction
-            && contact.radialDistance < cupOuterRadius + ballRadius
+        placement.heightAboveRim > -ballRadius * tuning.rimGraceFraction
+            && placement.radialDistance < cupOuterRadius + ballRadius
     }
 
     /// The shove given to a perched ball: horizontal, in the direction
@@ -502,14 +770,16 @@ struct TossController {
     /// Forgets a ball the caller has removed from the scene.
     mutating func retire(_ ball: BallID) {
         liveBalls.removeAll { $0 == ball }
-        scoredBalls.remove(ball)
+        hitBalls.remove(ball)
+        madeBalls.remove(ball)
     }
 
     /// Drops all per-ball state, e.g. when the podium is relocated and every
     /// ball is cleared out with it. Ids keep counting up.
     mutating func retireAll() {
         liveBalls.removeAll()
-        scoredBalls.removeAll()
+        hitBalls.removeAll()
+        madeBalls.removeAll()
         lastLaunch = nil
     }
 

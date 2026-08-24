@@ -183,15 +183,19 @@ struct GameRound: Equatable {
         return false
     }
 
-    /// Credits a ball that landed in the cup.
+    /// Credits a ball that earned points.
     ///
-    /// - Returns: `true` if the point went to a round. `false` means the throw
+    /// The round does not care *which* tier earned them (FR-005: +1 for
+    /// touching the cup, the balance of +10 for landing in it) — that rule
+    /// lives in `TossController`, which hands the arithmetic down as a number.
+    ///
+    /// - Returns: `true` if the points went to a round. `false` means the throw
     ///   was free practice (or landed while paused), and the caller should tally
     ///   it somewhere that is not a round score.
     @discardableResult
-    mutating func registerScore() -> Bool {
+    mutating func registerScore(_ points: Int = 1) -> Bool {
         guard countsScores else { return false }
-        score += 1
+        score += points
         return true
     }
 
