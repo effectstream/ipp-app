@@ -9,6 +9,13 @@ struct LeaderboardView: View {
     @State private var loading = true
     @State private var error: String?
     @State private var showingGame = false
+    /// Locations for the mini-game's floor map (FR-013).
+    ///
+    /// Fetched **here**, at the app layer, and handed to the game as plain
+    /// coordinates so that nothing under `ios/IPP/Game/` performs a request
+    /// (FR-008, question Q5). Starts as the offline sample, so opening the game
+    /// before the fetch lands shows a map rather than an empty plate.
+    @State private var floorMap = FloorMapData(pins: SyntheticMapPins.pins(), isLive: false)
 
     /// The AR mini-game only runs where ARKit world tracking does — elsewhere
     /// (Simulator, unsupported hardware) the entry point stays disabled with an
@@ -77,8 +84,9 @@ struct LeaderboardView: View {
                 }
             }
             .task { await load() }
+            .task { await loadFloorMap() }
             .fullScreenCover(isPresented: $showingGame) {
-                TrophyTossView()
+                TrophyTossView(floorMap: floorMap)
             }
         }
     }
@@ -156,6 +164,20 @@ struct LeaderboardView: View {
             self.error = error.localizedDescription
         }
         loading = false
+    }
+
+    /// Reads the anonymized map pins for the mini-game's floor map.
+    ///
+    /// Best-effort and silent: when the backend does not answer, `resolve`
+    /// substitutes the offline sample and the map's own caption says so. Only
+    /// runs where the game can run, so a device that will never show the map
+    /// never makes the request.
+    private func loadFloorMap() async {
+        guard gameAvailable else { return }
+        floorMap = MapPinsService.resolve(
+            fetched: await env.fetchMapPins(),
+            fallback: SyntheticMapPins.pins()
+        )
     }
 }
 

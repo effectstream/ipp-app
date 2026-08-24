@@ -24,8 +24,10 @@ enum SyntheticStandings {
 
     /// One fictional entry.
     struct Entry: Equatable {
-        /// 1-based place. `1`, `2` and `3` are the podium steps; the rest go in
-        /// the crawl.
+        /// 1-based place. `1`, `2` and `3` are the podium steps and the only
+        /// ones displayed since Phase 5C removed the crawl; the rest of the
+        /// list is still generated so the three shown places are the top of a
+        /// real ranking rather than the whole of one.
         let rank: Int
         /// Full display name, e.g. `"Dra. Marta Ficticia"`.
         let name: String
@@ -37,8 +39,8 @@ enum SyntheticStandings {
 
     // MARK: - Tuning
 
-    /// How many places the podium knows about: three on the steps and the rest
-    /// in the crawl.
+    /// How many places the podium knows about. Three go on the steps; the rest
+    /// only exist so those three sit at the top of a plausible ranking.
     static let defaultCount = 10
 
     /// Fixed by default so the podium is the same every time it is placed.
@@ -83,13 +85,6 @@ enum SyntheticStandings {
             points -= gap(using: &generator)
         }
         return entries
-    }
-
-    /// The line the Star Wars crawl shows for a place outside the podium
-    /// (FR-013). Spanish, and in the app's own vocabulary — the leaderboard
-    /// says "puntos".
-    static func crawlLine(for entry: Entry) -> String {
-        "\(entry.rank).º  \(entry.name) · \(formattedPoints(entry.points)) puntos"
     }
 
     /// Points with a Spanish thousands separator: `4820` → `"4.820"`.

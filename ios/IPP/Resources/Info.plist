@@ -24,6 +24,8 @@
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>IPP usa la cámara únicamente en el mini-juego de realidad aumentada "Tiro al Trofeo", para detectar una superficie y colocar el podio sobre ella. No se graban ni se envían imágenes.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>IPP busca el servidor de la clínica en tu red local (Wi-Fi) para cargar y guardar las fichas, el ranking y el mapa de ubicaciones. No se contacta ningún servicio externo.</string>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UISupportedInterfaceOrientations</key>

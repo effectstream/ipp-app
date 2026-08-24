@@ -15,10 +15,20 @@ import UIKit
 ///
 /// Closing the screen removes the AR container, which tears the session down
 /// (FR-011). The game is fully offline: this file makes no network request and
-/// never touches `AppEnvironment` or the leaderboard data (FR-008).
+/// never touches `AppEnvironment` or the leaderboard data (FR-008). The floor
+/// map's locations arrive from outside as a plain value — see ``floorMap``.
 struct TrophyTossView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+
+    /// Locations for the floor map under the podium (FR-013).
+    ///
+    /// Resolved by the **app layer** before this screen opens: either pins the
+    /// backend returned or the offline sample. Passing it in rather than
+    /// fetching it here is what keeps every file under `ios/IPP/Game/` free of
+    /// networking (question Q5, option A). The default means the game is still
+    /// launchable from nothing — it just shows the sample.
+    var floorMap: FloorMapData = FloorMapData(pins: SyntheticMapPins.pins(), isLive: false)
 
     @State private var permission: ARSupport.CameraPermission = .notDetermined
     @State private var isAsking = false
@@ -57,7 +67,7 @@ struct TrophyTossView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            PodiumARViewContainer(model: arModel)
+            PodiumARViewContainer(model: arModel, floorMap: floorMap)
                 .ignoresSafeArea()
 
             VStack(spacing: 10) {

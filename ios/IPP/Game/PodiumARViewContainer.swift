@@ -178,13 +178,19 @@ final class PodiumARModel: ObservableObject {
 /// un-delegated, anchors and subscriptions dropped — so closing the game leaves
 /// nothing running behind the leaderboard (FR-011).
 ///
-/// Offline by construction: nothing here performs any networking (FR-008).
+/// Offline by construction: nothing here performs any networking (FR-008). The
+/// floor map's pins arrive as a plain `FloorMapData` value fetched by the app
+/// layer and handed down through `TrophyTossView` (FR-013, question Q5).
 struct PodiumARViewContainer: UIViewRepresentable {
 
     @ObservedObject var model: PodiumARModel
+    /// Locations for the floor map under the podium. Already resolved by the
+    /// app layer to either live backend pins or the offline sample; this view
+    /// just draws whatever it is given.
+    var floorMap: FloorMapData
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(model: model)
+        Coordinator(model: model, floorMap: floorMap)
     }
 
     func makeUIView(context: Context) -> ARView {
@@ -206,7 +212,9 @@ struct PodiumARViewContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: ARView, context: Context) {
-        // All state flows out of the coordinator; nothing to push back in.
+        // The one thing that flows *in*: the pins, which the app layer may
+        // still have been fetching when this screen opened.
+        context.coordinator.updateFloorMap(floorMap)
     }
 
     /// Full teardown when the game screen goes away (FR-011).
@@ -287,11 +295,18 @@ struct PodiumARViewContainer: UIViewRepresentable {
         /// celebration freezes the podium and then resumes from the same phase
         /// instead of jumping (FR-012).
         private var breathTime: TimeInterval = 0
-        /// The crawl clock. Never pauses — the crawl is scenery and touches
-        /// nothing (FR-013).
-        private var crawlTime: TimeInterval = 0
-        /// The name labels and the crawl, built once at placement.
+        /// The three name labels, built once at placement.
         private var standings: StandingsDisplay.Display?
+        /// The pins the floor map is currently drawing. Set at init from the
+        /// SwiftUI value and replaced whenever the app layer's fetch lands
+        /// (FR-013).
+        private var floorMap: FloorMapData
+        /// The built map, kept so a late fetch can swap it without disturbing
+        /// anything else in the scene.
+        private weak var floorMapEntity: Entity?
+        /// The podium's scene root, cached so the map can be rebuilt into the
+        /// same parent the rest of the scenery hangs from.
+        private weak var podiumScene: Entity?
         /// When the current +1 pulse finishes, in `CACurrentMediaTime()`
         /// seconds. Zero when no pulse is running.
         private var pulseEndsAt: TimeInterval = 0
@@ -326,8 +341,9 @@ struct PodiumARViewContainer: UIViewRepresentable {
             var rimNudges: Int = 0
         }
 
-        init(model: PodiumARModel) {
+        init(model: PodiumARModel, floorMap: FloorMapData) {
             self.model = model
+            self.floorMap = floorMap
             super.init()
             model.relocateHandler = { [weak self] in self?.relocate() }
         }
@@ -488,6 +504,7 @@ struct PodiumARViewContainer: UIViewRepresentable {
             arView.scene.addAnchor(anchor)
 
             podiumAnchor = anchor
+            podiumScene = scene
             model.phase = .placed
             model.transientHint = nil
 
@@ -511,18 +528,18 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
         // MARK: - Scenery (FR-012, FR-013)
 
-        /// Wires up everything the podium does for show: the breathing steps
-        /// and the synthetic standings.
+        /// Wires up everything the podium does for show: the breathing steps,
+        /// the three name labels and the floor map of data locations.
         ///
-        /// The standings are invented on the spot by `SyntheticStandings` — no
-        /// leaderboard is read and no request is made, here or anywhere in the
-        /// game (FR-008, SC-005).
+        /// The names are invented on the spot by `SyntheticStandings`. The
+        /// map's pins were fetched by the **app layer** and handed in as plain
+        /// coordinates — no request is made here or anywhere else under
+        /// `ios/IPP/Game/` (FR-008, SC-005, question Q5).
         private func installScenery(in scene: Entity) {
             stepEntities = [:]
             stepHeights = [:]
             stepRungs = [:]
             breathTime = 0
-            crawlTime = 0
 
             for step in PodiumBuilder.Step.allCases {
                 guard let entity = scene.findEntity(named: step.entityName) as? ModelEntity else {
@@ -537,6 +554,7 @@ struct PodiumARViewContainer: UIViewRepresentable {
             _ = PodiumBreathing.ladders
 
             standings = StandingsDisplay.attach(to: scene, standings: SyntheticStandings.standings())
+            rebuildFloorMap(in: scene)
 
             // Put the steps on their phase-zero rungs now, so the podium
             // appears already breathing instead of snapping into shape on the
@@ -551,16 +569,45 @@ struct PodiumARViewContainer: UIViewRepresentable {
             stepHeights = [:]
             stepRungs = [:]
             standings = nil
+            floorMapEntity = nil
+            podiumScene = nil
             breathTime = 0
-            crawlTime = 0
         }
 
-        /// One frame of scenery: the steps breathe, the labels follow them and
-        /// turn to the player, the crawl marches.
+        // MARK: Floor map (FR-013, Phase 5C)
+
+        /// New pins from the app layer.
+        ///
+        /// Called from `updateUIView`, so it runs on every SwiftUI update of
+        /// the containing view — hence the equality guard, which makes all but
+        /// the one update that actually changes the data free. When the podium
+        /// is not down yet there is nothing to rebuild: `installScenery` will
+        /// use the stored value.
+        func updateFloorMap(_ data: FloorMapData) {
+            guard data != floorMap else { return }
+            floorMap = data
+            guard let podiumScene else { return }
+            rebuildFloorMap(in: podiumScene)
+        }
+
+        /// Replaces the map under the podium with one drawn from the current
+        /// pins. The map carries no collider and no physics body, so removing
+        /// and re-adding it cannot disturb a ball in flight.
+        private func rebuildFloorMap(in scene: Entity) {
+            floorMapEntity?.removeFromParent()
+            let map = FloorMap.make(floorMap)
+            scene.addChild(map)
+            floorMapEntity = map
+        }
+
+        /// One frame of scenery: the steps breathe and the labels follow them
+        /// and turn to the player.
         ///
         /// None of it can affect play. The steps' colliders are swapped with
         /// their meshes so a ball always rests on what it looks like it is
-        /// resting on; the labels and the crawl have no collider at all.
+        /// resting on; the labels and the floor map have no collider at all.
+        /// The map is static — it is built at placement and never touched per
+        /// frame.
         private func stepScenery(deltaTime: TimeInterval) {
             guard podiumAnchor != nil else { return }
 
@@ -572,8 +619,6 @@ struct PodiumARViewContainer: UIViewRepresentable {
             }
 
             guard let standings else { return }
-            crawlTime += deltaTime
-            StandingsDisplay.update(standings, at: crawlTime)
             seatLabels(standings)
         }
 

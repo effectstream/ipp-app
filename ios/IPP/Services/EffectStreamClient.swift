@@ -38,7 +38,9 @@ enum EffectStreamError: Error, LocalizedError {
 }
 
 final class EffectStreamClient {
-    let baseURL: URL
+    /// Mutable so `AppEnvironment.resolveBackend()` can re-point the client at
+    /// the LAN host discovered at launch (Phase 5C).
+    var baseURL: URL
 
     init(baseURL: URL) {
         self.baseURL = baseURL

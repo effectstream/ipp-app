@@ -9,7 +9,10 @@ import SwiftUI
 @MainActor
 final class SchemaService: ObservableObject {
     @Published private(set) var schema: FormSchema
-    private let baseURL: URL
+    /// Mutable so `AppEnvironment.resolveBackend()` can re-point the schema
+    /// refresh at the LAN host discovered at launch (Phase 5C). Set before the
+    /// first `refresh()`.
+    var baseURL: URL
     private static let cacheKey = "ipp.schema.v1"
 
     private static var cachedFromDisk: FormSchema? {

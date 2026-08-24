@@ -4,7 +4,11 @@ import Foundation
 // IPP backend, which persists to Neon Postgres. The backend extracts id, RUT
 // and coords for indexing; the full record lives in a JSONB column.
 final class APIPatientStore: PatientStore {
-    let baseURL: URL
+    /// Mutable so `AppEnvironment.resolveBackend()` can re-point the app at the
+    /// LAN host it found at launch (Phase 5C). Written once, from the main
+    /// actor, before the first request — same convention as the two provider
+    /// closures below.
+    var baseURL: URL
     /// Closure returning the current doctor name (or nil). Read lazily so a
     /// rename via the leaderboard UI takes effect on the next save.
     var doctorNameProvider: () -> String? = { nil }
