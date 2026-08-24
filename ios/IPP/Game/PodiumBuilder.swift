@@ -37,6 +37,9 @@ enum PodiumBuilder {
         static let cupFloor = "cup_floor"
         static let cupTrigger = "cup_trigger"
         static let floor = "floor"
+        /// Balls are named `ball_<id>` so a scene dump stays readable; the game
+        /// itself matches them by identity, not by name.
+        static let ballPrefix = "ball_"
     }
 
     // MARK: - Dimensions
@@ -91,6 +94,10 @@ enum PodiumBuilder {
         static let gold = UIColor(red: 0.95, green: 0.78, blue: 0.18, alpha: 1)
         static let silver = UIColor(red: 0.75, green: 0.78, blue: 0.82, alpha: 1)
         static let bronze = UIColor(red: 0.80, green: 0.50, blue: 0.20, alpha: 1)
+        /// The ball wears the brand teal (`LinearGradient.ippBrand`'s light
+        /// stop, `#13837E`) so it reads as the app's rather than as a stray
+        /// object, and stays legible against gold and against most desks.
+        static let ball = UIColor(red: 0x13 / 255, green: 0x83 / 255, blue: 0x7E / 255, alpha: 1)
     }
 
     // MARK: - Public assembly
@@ -340,6 +347,43 @@ enum PodiumBuilder {
             restitution: 0.25
         )
         return floor
+    }
+
+    // MARK: - Ball (FR-004)
+
+    /// One throwable ball: a small dynamic sphere in the brand teal.
+    ///
+    /// Dimensions and physics material come from `TossController.Tuning`, which
+    /// is where Gate 3's feel feedback gets applied — this function only turns
+    /// those numbers into an entity.
+    ///
+    /// Continuous collision detection is on: at 4.5 m/s a 3.5 cm ball moves
+    /// ~7.5 cm per 60 Hz step, further than the cup's 6 mm walls are thick, so
+    /// discrete stepping would let a hard throw tunnel straight through the cup.
+    static func makeBall(
+        id: UInt64,
+        radius: Float,
+        mass: Float,
+        friction: Float,
+        restitution: Float
+    ) -> ModelEntity {
+        let ball = ModelEntity(
+            mesh: .generateSphere(radius: radius),
+            materials: [material(Medal.ball, roughness: 0.35)]
+        )
+        ball.name = "\(Name.ballPrefix)\(id)"
+        ball.components.set(CollisionComponent(shapes: [.generateSphere(radius: radius)]))
+        var body = PhysicsBodyComponent(
+            massProperties: .init(mass: mass),
+            material: .generate(friction: friction, restitution: restitution),
+            mode: .dynamic
+        )
+        body.isContinuousCollisionDetectionEnabled = true
+        ball.components.set(body)
+        // Present from the start so the culler can read the ball's speed on the
+        // very first frame instead of treating it as motionless.
+        ball.components.set(PhysicsMotionComponent())
+        return ball
     }
 
     // MARK: - Helpers

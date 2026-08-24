@@ -32,6 +32,10 @@ final class PodiumARModel: ObservableObject {
     @Published fileprivate(set) var failure: String?
     /// Short-lived feedback, e.g. a tap that hit no surface.
     @Published fileprivate(set) var transientHint: String?
+    /// Balls landed in the cup since the game screen opened. Phase 4 replaces
+    /// this free-play counter with a per-round score (FR-007); for now it is the
+    /// whole HUD.
+    @Published fileprivate(set) var score: Int = 0
 
     /// Installed by the coordinator so the overlay's "Reubicar" button can
     /// reach the AR session.
@@ -50,7 +54,7 @@ final class PodiumARModel: ObservableObject {
         case .readyToPlace:
             return "Toca la superficie para colocar el podio."
         case .placed:
-            return "Podio colocado. Lanza pelotas o pulsa Reubicar."
+            return "Desliza hacia arriba para lanzar la pelota a la copa."
         }
     }
 
@@ -58,6 +62,10 @@ final class PodiumARModel: ObservableObject {
     /// a new spot. Phase 4 will additionally forbid this mid-round.
     func relocate() {
         relocateHandler?()
+    }
+
+    fileprivate func registerScore() {
+        score += 1
     }
 
     fileprivate func flash(_ message: String) {
@@ -72,7 +80,12 @@ final class PodiumARModel: ObservableObject {
 
 /// The AR half of "Tiro al Trofeo": a RealityKit `ARView` running world
 /// tracking with horizontal plane detection, an `ARCoachingOverlayView` for the
-/// scan hint, and tap-to-place for the procedural podium (FR-002, FR-003).
+/// scan hint, tap-to-place for the procedural podium (FR-002, FR-003) and
+/// swipe-to-throw for the balls, including cup scoring and ball culling
+/// (FR-004, FR-005, FR-006).
+///
+/// The rules of the throw live in `TossController`, which knows nothing about
+/// ARKit; this file supplies the camera pose, the entities and the frame clock.
 ///
 /// The session is torn down completely when SwiftUI removes the view — paused,
 /// un-delegated, anchors and subscriptions dropped — so closing the game leaves
@@ -123,18 +136,43 @@ struct PodiumARViewContainer: UIViewRepresentable {
         private weak var arView: ARView?
         private let coachingOverlay = ARCoachingOverlayView()
         private var tapRecognizer: UITapGestureRecognizer?
+        private var panRecognizer: UIPanGestureRecognizer?
 
         /// The one anchor the podium lives on. Kept so relocation can remove
         /// exactly it, and so tracking recovery can be checked against it.
         private var podiumAnchor: AnchorEntity?
-        /// Phase 3 will put its collision subscriptions here; the array exists
-        /// now so teardown is already correct.
         private var subscriptions: [any Cancellable] = []
+        /// Cup-trigger subscription, held apart from the rest because it is made
+        /// and dropped with the podium rather than with the view.
+        private var cupSubscription: (any Cancellable)?
         private var lifecycleObservers: [NSObjectProtocol] = []
 
         private var hasSeenPlane = false
         private var isPausedForBackground = false
         private var isTornDown = false
+
+        // MARK: Toss state (Phase 3)
+
+        /// Rules and tuning for the toss — pure, and unit-tested off-device.
+        private var toss = TossController()
+        /// Balls currently in the scene, with the bookkeeping the culler needs.
+        private var balls: [LiveBall] = []
+        /// When the current swipe started, in `CACurrentMediaTime()` seconds.
+        private var swipeStart: TimeInterval?
+        /// The trophy's resting transform, captured at placement so the score
+        /// pulse always animates back to a known pose rather than to whatever
+        /// mid-animation value it happens to read.
+        private var trophyRestTransform: Transform?
+        private let successHaptics = UINotificationFeedbackGenerator()
+
+        /// One ball in flight: the entity plus the two timers the culling rules
+        /// in `TossController` are written against (FR-006).
+        private struct LiveBall {
+            let id: TossController.BallID
+            let entity: ModelEntity
+            var age: TimeInterval = 0
+            var restingFor: TimeInterval = 0
+        }
 
         init(model: PodiumARModel) {
             self.model = model
@@ -144,14 +182,25 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
         // MARK: Session configuration
 
-        /// World tracking with horizontal plane detection — the minimum the
-        /// game needs, and nothing more (no people occlusion, no scene mesh),
-        /// which keeps the frame rate healthy on older iPhones.
+        /// World tracking with horizontal plane detection, plus person
+        /// occlusion where the hardware offers it. No scene mesh — the podium
+        /// only ever sits on a detected plane, so reconstruction would cost
+        /// frame rate for nothing.
+        ///
+        /// Person occlusion comes from Gate 2's one finding (row 2.4): with it
+        /// off, a hand passing in front of the phone is painted *behind* the
+        /// podium, which reads as broken. `.personSegmentationWithDepth` makes
+        /// people and hands occlude virtual content at the right depth. It needs
+        /// an A12 or newer device, so the capability is checked and the game
+        /// simply runs without it on older hardware.
         private func makeConfiguration() -> ARWorldTrackingConfiguration {
             let configuration = ARWorldTrackingConfiguration()
             configuration.planeDetection = [.horizontal]
             configuration.environmentTexturing = .automatic
             configuration.isLightEstimationEnabled = true
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) {
+                configuration.frameSemantics.insert(.personSegmentationWithDepth)
+            }
             return configuration
         }
 
@@ -165,6 +214,21 @@ struct PodiumARViewContainer: UIViewRepresentable {
             let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
             arView.addGestureRecognizer(tap)
             tapRecognizer = tap
+
+            // Tap places the podium, swipe throws a ball. The two never fight:
+            // a pan only begins once the finger has moved, which a tap never
+            // does, and the swipe handler ignores everything until the podium
+            // is down.
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+            pan.maximumNumberOfTouches = 1
+            arView.addGestureRecognizer(pan)
+            panRecognizer = pan
+
+            subscriptions.append(
+                arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] event in
+                    MainActor.assumeIsolated { self?.stepBalls(deltaTime: event.deltaTime) }
+                }
+            )
 
             observeAppLifecycle()
         }
@@ -267,11 +331,29 @@ struct PodiumARViewContainer: UIViewRepresentable {
             model.phase = .placed
             model.transientHint = nil
 
+            trophyRestTransform = scene.findEntity(named: PodiumBuilder.Name.trophy)?.transform
+            subscribeToCup(in: arView, anchor: anchor)
+            // Warms the Taptic Engine so the first score's haptic is immediate.
+            successHaptics.prepare()
+
             // From here the player is looking at the podium, so stop the
             // full-screen coaching overlay from covering it; our own hint takes
             // over if tracking degrades.
             coachingOverlay.activatesAutomatically = false
             coachingOverlay.setActive(false, animated: true)
+        }
+
+        /// Listens to the cup's invisible trigger volume, which is the only
+        /// thing that can turn a ball into a point (FR-005).
+        private func subscribeToCup(in arView: ARView, anchor: AnchorEntity) {
+            cupSubscription = nil
+            guard let trigger = anchor.findEntity(named: PodiumBuilder.Name.cupTrigger) else { return }
+            cupSubscription = arView.scene.subscribe(
+                to: CollisionEvents.Began.self,
+                on: trigger
+            ) { [weak self] event in
+                MainActor.assumeIsolated { self?.handleCupEntry(event) }
+            }
         }
 
         /// Rotation about +Y that turns the podium's front (+Z) toward the
@@ -287,11 +369,168 @@ struct PodiumARViewContainer: UIViewRepresentable {
 
         private func relocate() {
             guard !isTornDown, let arView, let anchor = podiumAnchor else { return }
+            // The balls are children of this anchor, so removing it takes them
+            // with it; the controller has to be told so its live-ball cap does
+            // not stay pinned at the balls that no longer exist.
+            balls.removeAll()
+            toss.retireAll()
+            cupSubscription = nil
+            trophyRestTransform = nil
             arView.scene.removeAnchor(anchor)
             podiumAnchor = nil
             model.phase = hasSeenPlane ? .readyToPlace : .scanning
             model.transientHint = nil
             coachingOverlay.activatesAutomatically = true
+        }
+
+        // MARK: - Tossing (FR-004)
+
+        /// A swipe anywhere on the AR view throws a ball. Power comes from how
+        /// fast the finger travelled *upward*, aim from where the phone points,
+        /// and a nudge left or right from the swipe's horizontal component —
+        /// all of it decided by `TossController`, which this method only feeds
+        /// and obeys.
+        @objc
+        private func handlePan(_ gesture: UIPanGestureRecognizer) {
+            guard !isTornDown, let arView, podiumAnchor != nil else { return }
+
+            switch gesture.state {
+            case .began:
+                swipeStart = CACurrentMediaTime()
+            case .ended:
+                let now = CACurrentMediaTime()
+                let started = swipeStart ?? now
+                swipeStart = nil
+                let translation = gesture.translation(in: arView)
+                throwBall(
+                    TossController.Swipe(
+                        translation: SIMD2(Float(translation.x), Float(translation.y)),
+                        duration: now - started
+                    ),
+                    at: now
+                )
+            case .cancelled, .failed:
+                swipeStart = nil
+            default:
+                break
+            }
+        }
+
+        private func throwBall(_ swipe: TossController.Swipe, at now: TimeInterval) {
+            guard let arView,
+                  let anchor = podiumAnchor,
+                  let frame = arView.session.currentFrame
+            else { return }
+
+            let camera = TossController.CameraBasis(transform: frame.camera.transform)
+
+            switch toss.flick(swipe, camera: camera, at: now) {
+            case .rejected(.tooManyLiveBalls):
+                model.flash("Demasiadas pelotas en juego. Espera un momento.")
+            case .rejected:
+                // A drag that was not a toss, or a flick inside the 0.3 s rate
+                // limit. Both are the player's normal behaviour, not errors, so
+                // they pass in silence.
+                break
+            case .launched(let launch):
+                spawn(launch, on: anchor)
+            }
+        }
+
+        /// Puts one ball into the scene and pushes it.
+        ///
+        /// The ball is parented to the **podium's own anchor** rather than to a
+        /// new one: RealityKit simulates physics per anchor, so a ball on any
+        /// other anchor would fall straight through the steps, the cup and the
+        /// floor plane.
+        private func spawn(_ launch: TossController.Launch, on anchor: AnchorEntity) {
+            let ball = PodiumBuilder.makeBall(
+                id: launch.ball,
+                radius: toss.tuning.ballRadius,
+                mass: toss.tuning.ballMass,
+                friction: toss.tuning.ballFriction,
+                restitution: toss.tuning.ballRestitution
+            )
+            anchor.addChild(ball)
+            // The launch is computed in world space; the ball's transform is
+            // relative to the anchor it now hangs from.
+            ball.position = anchor.convert(position: launch.origin, from: nil)
+            ball.applyLinearImpulse(launch.impulse, relativeTo: nil)
+            balls.append(LiveBall(id: launch.ball, entity: ball))
+        }
+
+        // MARK: - Scoring (FR-005, SC-002)
+
+        private func handleCupEntry(_ event: CollisionEvents.Began) {
+            guard !isTornDown else { return }
+            // One of the two entities is the trigger volume; the other is
+            // whatever crossed it. Only a ball we launched counts.
+            guard let ball = balls.first(where: { $0.entity === event.entityA || $0.entity === event.entityB })
+            else { return }
+            // False unless this is the ball's *first* crossing, so a ball that
+            // settles, rolls and re-triggers still scores exactly once.
+            guard toss.score(ball.id) else { return }
+
+            model.registerScore()
+            celebrate()
+        }
+
+        /// Success cue: the success haptic plus a quick swell of the trophy, so
+        /// the score reads even when the phone is at arm's length.
+        private func celebrate() {
+            successHaptics.notificationOccurred(.success)
+            successHaptics.prepare()
+
+            guard let trophy = podiumAnchor?.findEntity(named: PodiumBuilder.Name.trophy),
+                  let rest = trophyRestTransform
+            else { return }
+
+            var swollen = rest
+            swollen.scale = rest.scale * 1.28
+            _ = trophy.move(to: swollen, relativeTo: trophy.parent, duration: 0.14, timingFunction: .easeOut)
+
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                guard let self, !self.isTornDown, let rest = self.trophyRestTransform else { return }
+                _ = trophy.move(to: rest, relativeTo: trophy.parent, duration: 0.22, timingFunction: .easeInOut)
+            }
+        }
+
+        // MARK: - Culling (FR-006, SC-006)
+
+        /// Runs once per rendered frame: ages every live ball, tracks how long
+        /// it has been still, and removes it once `TossController` says it is
+        /// litter — at rest, off the table, or simply too old. This is what
+        /// keeps a minute of spam-flicking bounded (SC-006).
+        private func stepBalls(deltaTime: TimeInterval) {
+            guard !isTornDown, !balls.isEmpty, let anchor = podiumAnchor else { return }
+
+            var survivors: [LiveBall] = []
+            survivors.reserveCapacity(balls.count)
+
+            for var ball in balls {
+                ball.age += deltaTime
+                let speed = simd_length(ball.entity.physicsMotion?.linearVelocity ?? .zero)
+                ball.restingFor = toss.restingDuration(
+                    previous: ball.restingFor,
+                    speed: speed,
+                    delta: deltaTime
+                )
+                let height = ball.entity.position(relativeTo: anchor).y
+
+                if toss.cullReason(
+                    age: ball.age,
+                    restingFor: ball.restingFor,
+                    heightAboveAnchor: height
+                ) != nil {
+                    ball.entity.removeFromParent()
+                    toss.retire(ball.id)
+                } else {
+                    survivors.append(ball)
+                }
+            }
+
+            balls = survivors
         }
 
         // MARK: ARSessionDelegate / ARCoachingOverlayViewDelegate
@@ -391,6 +630,12 @@ struct PodiumARViewContainer: UIViewRepresentable {
             lifecycleObservers.removeAll()
 
             subscriptions.removeAll()
+            cupSubscription = nil
+
+            balls.removeAll()
+            toss.retireAll()
+            trophyRestTransform = nil
+            swipeStart = nil
 
             coachingOverlay.delegate = nil
             coachingOverlay.session = nil
@@ -400,11 +645,15 @@ struct PodiumARViewContainer: UIViewRepresentable {
                 if let tapRecognizer {
                     arView.removeGestureRecognizer(tapRecognizer)
                 }
+                if let panRecognizer {
+                    arView.removeGestureRecognizer(panRecognizer)
+                }
                 arView.scene.anchors.removeAll()
                 arView.session.pause()
                 arView.session.delegate = nil
             }
             tapRecognizer = nil
+            panRecognizer = nil
             podiumAnchor = nil
             arView = nil
         }

@@ -6,7 +6,8 @@ import UIKit
 ///
 /// Two faces, chosen by whether the game can actually run:
 /// - the **AR screen** (`gameScreen`) — a full-bleed `PodiumARViewContainer`
-///   with a thin Spanish overlay: hint, Reubicar, close (FR-002, FR-009);
+///   with a thin Spanish overlay: hint, Reubicar, close and the session score
+///   (FR-002, FR-005, FR-009);
 /// - the **explainer screen** (`infoScreen`) — the camera-permission story.
 ///   It asks for the camera when this view appears, the only moment the app
 ///   ever asks (FR-010), and offers a shortcut to Ajustes when the answer is no.
@@ -95,8 +96,31 @@ struct TrophyTossView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.white)
                 .background(Color.ippTeal.opacity(0.92), in: Capsule())
+
+                scorePill
             }
         }
+    }
+
+    /// The whole HUD for now: how many balls have gone in since the screen
+    /// opened. Phase 4 puts a countdown and a round score in its place (FR-007).
+    private var scorePill: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "trophy.fill")
+                .font(.subheadline.weight(.semibold))
+            Text("\(arModel.score)")
+                .font(.title3.weight(.bold))
+                .monospacedDigit()
+                .contentTransition(.numericText(value: Double(arModel.score)))
+        }
+        .foregroundStyle(Color.ippGold)
+        .padding(.horizontal, 14)
+        .frame(height: 40)
+        .background(Color.ippInk.opacity(0.65), in: Capsule())
+        .animation(.snappy(duration: 0.25), value: arModel.score)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Puntos")
+        .accessibilityValue("\(arModel.score)")
     }
 
     private var hintBar: some View {
