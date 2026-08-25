@@ -77,7 +77,9 @@ size the radius of affectation, and act locally.
 │   ├── Models/                   # Patient, FormSchema, FieldStats, ...
 │   ├── Services/                 # APIPatientStore, SessionService, Wallet, SchemaService, AppEnvironment
 │   ├── Components/               # AddressPicker (CoreLocation), MultiSelectAutocomplete
+│   ├── Game/                     # Tiro al Trofeo - ARKit/RealityKit podium mini-game
 │   └── Views/                    # Home, DynamicForm (StatCaption), Leaderboard, WebDashboard, Theme
+├── ios/IPPTests/                 # unit tests - game logic, geometry, backend locator (no backend needed)
 ├── web/src/                      # Vite + React dashboard
 │   └── components/               # MapView, MapFilters, AnnotationsLayer, DrawingController, Feedback, PinVerify
 └── cardano/                      # EffectStream workspace - local Cardano devnet + sync
@@ -112,7 +114,9 @@ areas** ([AnnotationsLayer](web/src/components/AnnotationsLayer.tsx),
 [DrawingController](web/src/components/DrawingController.tsx),
 [AnnotationsList](web/src/components/AnnotationsList.tsx)) to mark interventions -
 the manual planning layer that turns a cluster into "assign a specialist here."
-(Again: location-based AR anchored through GPS, not a camera overlay.)
+(Again: this layer is anchored through GPS, not through the camera - the one
+camera-based piece in IPP is the
+[Tiro al Trofeo](#tiro-al-trofeo---camera-based-ar-mini-game) mini-game.)
 
 ### Engine
 
@@ -146,6 +150,48 @@ and the `/api/v1/leaderboard` query):
 Search actions are logged via `POST /api/v1/events`; field/record counts are
 computed from the stored data. Each account also has a Cardano wallet address
 shown in the app, tying the contributor to an on-chain identity.
+
+### Tiro al Trofeo - camera-based AR mini-game
+
+The leaderboard has a **"Jugar"** entry point that opens **Tiro al Trofeo**, a
+single-player ARKit/RealityKit mini-game built around the podium the ranking
+already draws in gold/silver/bronze
+([ios/IPP/Game/](ios/IPP/Game/), opened from
+[LeaderboardView.swift](ios/IPP/Views/LeaderboardView.swift)).
+
+> **Screenshot / GIF placeholder** - a short capture of a round (place the
+> podium → flick → make → summary) will be added here.
+
+- **Place it.** Scan a desk or the floor, tap a detected horizontal plane, and a
+  procedural podium appears - three steps in the leaderboard's exact medal
+  colours plus a trophy cup. No 3D asset files: everything is generated in code.
+- **Play it.** Flick upward from anywhere on the screen; the ball launches from
+  where your finger started, aimed where the phone points. Touching the cup
+  scores **+1**, landing inside scores **+10**, and the cup hops to a different
+  step after every make. Rounds are 60 s with a countdown, an end-of-round
+  summary, and a **device-local** best score.
+- **Watch it.** The steps slowly breathe, the top-3 places float above them as
+  labels, and a field of dots on the floor around the podium maps where the
+  app's records are, pulsing so it reads as live data.
+- **The game awards no leaderboard points and writes nothing.** It never touches
+  the ranking, never posts an event, and its only persistence is one integer in
+  `UserDefaults`. The game module itself makes **zero** network requests.
+- **Offline behaviour.** The one thing that is live is the floor map: the app
+  layer (not the game) reads the public, anonymized `GET /api/v1/map-pins` and
+  hands the game plain coordinates. With the backend up the caption reads
+  **"Datos en vivo · N ubicaciones"**; with it down or unreachable the app
+  substitutes a synthetic offline sample and the caption reads **"Datos de
+  ejemplo · N ubicaciones"**. The game is fully playable either way.
+- **Permissions.** The camera is requested the first time you open the game -
+  never at app launch - and denying it shows a Spanish explanation with a
+  shortcut to Ajustes. On devices without ARKit world tracking (and in the
+  Simulator) the "Jugar" row is disabled with a label saying why; the rest of
+  the app is unaffected.
+
+Game logic that does not need a camera - toss physics, rounds, best score,
+podium and floor-map geometry - is covered by unit tests in
+[ios/IPPTests/](ios/IPPTests/) (`xcodebuild test`, see
+[iOS app](#ios-app)).
 
 ## Cardano anchor
 
@@ -297,6 +343,32 @@ curl http://localhost:3334/health
 
 Schema is created on startup (idempotent `CREATE TABLE IF NOT EXISTS`).
 
+#### Running against a local Postgres instead of Neon
+
+The backend targets Neon, and three things bite if you point it at a local
+database instead. None of them is fixed in code (a fix would touch the
+production path); they are written down here so the next person does not
+rediscover them:
+
+- **Postgres must serve TLS.** [backend/src/db.ts](backend/src/db.ts) passes
+  `ssl: "require"` as a postgres.js *client option*, which overrides any
+  `sslmode` in `DATABASE_URL`; unlike `prefer`, `require` never falls back to
+  plaintext, so a stock `docker run postgres:16` fails the handshake. A
+  self-signed certificate is enough (`require` does not verify the chain):
+  generate `server.crt`/`server.key`, copy them into the container's `PGDATA`
+  (owner `postgres`, key mode `600`), `ALTER SYSTEM SET ssl = on`, and restart
+  the container.
+- **`scripts/seed-cities.ts` no longer works.** It POSTs `/api/v1/patients`
+  with only a `Content-Type` header, but that route is behind `requireDoctor`
+  and every row comes back `401 missing auth headers`. The script predates the
+  signed-request auth ([backend/src/auth.ts](backend/src/auth.ts)).
+- **`scripts/seed-year.ts` needs a column the schema no longer creates.** Its
+  INSERT still lists the legacy plaintext `passcode`, while `initSchema` now
+  creates only `passcode_hash`. One
+  `ALTER TABLE patients ADD COLUMN IF NOT EXISTS passcode TEXT` before seeding
+  makes it run; it writes straight to Postgres, so it needs no auth and is the
+  richer data set anyway.
+
 ### Cardano devnet (for `CHAIN=cardano`)
 
 ```bash
@@ -324,11 +396,27 @@ brew install xcodegen       # one-time
 cd ios
 xcodegen generate
 open IPP.xcodeproj           # pick an iPhone simulator, ⌘R
+
+# unit tests (no backend needed - every suite is offline and deterministic)
+xcodebuild test -scheme IPP -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 
 The app talks to `http://localhost:3334` and embeds the web dashboard at
 `http://localhost:5174` (both set via `Info.plist`: `BackendURL`, `WebURL`).
 Demo logins: `user01`…`user10` / `pass01`…`pass10`.
+
+**Finding the backend from a real iPhone.** `localhost` is the phone itself, so
+a device build cannot use `BackendURL` as-is. At launch the app asks each host
+in the `Info.plist` array **`BackendCandidates`** for `/health` (1.5 s each, in
+order) and points every client - login, patients, field stats, schema,
+leaderboard, map pins - at the first one that answers, falling back to
+`BackendURL` if none does
+([ios/IPP/Services/BackendLocator.swift](ios/IPP/Services/BackendLocator.swift)).
+To run against your own Mac, put its LAN address in that array - a plist edit,
+no Swift change. In the Simulator the list is skipped and `BackendURL` is used
+directly. Requests wait for that resolution, so nothing can leave with a
+half-resolved URL; when nothing is reachable the first request pays the probe
+timeout once and then the app behaves offline as before.
 
 ## Doctor authentication
 
@@ -362,9 +450,12 @@ is the long-form write-up of the engineering and use-cases.
 
 ## What's intentionally not done
 
-- **AR is location-based, not camera-based.** There is no ARKit/RealityKit
-  overlay; the augmentation is anchored to place through GPS - the
-  location-aware stats and map planning layer.
+- **The clinical AR is location-based, not camera-based.** Everything that
+  augments the *work* - the local/país/mundo stat lines and the map planning
+  layer - is anchored to place through GPS, not to a camera feed. The only
+  camera-based AR in IPP is the [Tiro al Trofeo](#tiro-al-trofeo---camera-based-ar-mini-game)
+  mini-game on the leaderboard, which is a game and nothing else: it reads no
+  clinical record, awards no points and writes nothing.
 - **Demo accounts ship fixed seeds** - fine for a demo, but a real deployment
   needs per-user generated keys (see Roadmap).
 - **No smart-contract token mint** - the chain layer is metadata anchoring only.

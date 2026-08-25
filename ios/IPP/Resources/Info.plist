@@ -34,6 +34,14 @@
     </array>
     <key>BackendURL</key>
     <string>http://localhost:3334</string>
+    <!-- Hosts the app asks for /health at launch, in order, before falling back
+         to BackendURL. Edit this list (not Swift source) to point a phone at
+         your own Mac; leave it empty and the app only ever uses BackendURL. -->
+    <key>BackendCandidates</key>
+    <array>
+        <string>http://192.168.100.15:3334</string>
+        <string>http://192.168.100.11:3334</string>
+    </array>
     <key>WebURL</key>
     <string>http://localhost:5174</string>
     <key>NSAppTransportSecurity</key>

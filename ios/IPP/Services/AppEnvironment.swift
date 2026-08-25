@@ -28,6 +28,20 @@ final class AppEnvironment: ObservableObject {
     /// configured value and moves once, if the launch probe finds a LAN host.
     @Published private(set) var backendURL: URL
 
+    /// The one and only backend resolution, kept so that anything that needs a
+    /// URL can *wait* for it instead of racing it (question Q8).
+    private var resolution: Task<Void, Never>?
+
+    /// What the resolution actually asks the network. A stored closure only so
+    /// a test can hold resolution open and prove that dependent work waits;
+    /// production never replaces it.
+    var probeBackend: @Sendable (_ configured: URL, _ isSimulator: Bool) async -> URL? = {
+        configured, isSimulator in
+        await BackendLocator.probe(
+            BackendLocator.candidates(configured: configured, isSimulator: isSimulator)
+        )
+    }
+
     init(
         apiStore: APIPatientStore,
         effectStream: EffectStreamClient,
@@ -88,11 +102,35 @@ final class AppEnvironment: ObservableObject {
     /// Failure is silent and harmless: nothing moves, the app keeps the
     /// configured URL, and every screen shows the offline state it always did.
     func resolveBackend() async {
-        let candidates = BackendLocator.candidates(
-            configured: configuredBackendURL,
-            isSimulator: BackendLocator.isSimulator
-        )
-        guard let found = await BackendLocator.probe(candidates),
+        await backendReady()
+    }
+
+    /// Waits until the backend URL is settled, starting the probe if nobody
+    /// has yet, and returns immediately once it is (question Q8).
+    ///
+    /// Every request in the app goes through this first, so the launch window
+    /// in which a screen could fire a request at the *unresolved* URL is
+    /// closed: a user who taps straight into Ranking from a cold launch waits
+    /// out the probe (~10 ms when the first host answers) instead of sending
+    /// one doomed request to `localhost` and self-healing on refresh.
+    ///
+    /// Resolution happens exactly once per app run — the first caller starts
+    /// the task, everyone else awaits the same one — so this is free after
+    /// launch.
+    func backendReady() async {
+        if let resolution {
+            return await resolution.value
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performResolution()
+        }
+        resolution = task
+        await task.value
+    }
+
+    private func performResolution() async {
+        guard let found = await probeBackend(configuredBackendURL, BackendLocator.isSimulator),
               found != backendURL
         else { return }
 
@@ -106,10 +144,12 @@ final class AppEnvironment: ObservableObject {
     /// map. `nil` when the backend is unreachable — the caller substitutes the
     /// offline sample (`MapPinsService.resolve`).
     func fetchMapPins() async -> [GeoPin]? {
-        await mapPins.fetch(baseURL: backendURL)
+        await backendReady()
+        return await mapPins.fetch(baseURL: backendURL)
     }
 
     func saveAndAnchor(_ patient: Patient) async -> Patient? {
+        await backendReady()
         do {
             guard let wallet = session.wallet else {
                 lastError = "Inicia sesión para guardar y anclar."
@@ -132,16 +172,19 @@ final class AppEnvironment: ObservableObject {
     }
 
     func fetchLeaderboard() async throws -> [LeaderboardEntry] {
-        try await apiStore.fetchLeaderboard()
+        await backendReady()
+        return try await apiStore.fetchLeaderboard()
     }
 
     /// Records a search for ranking points (+10). Best-effort, viewer-safe.
     func recordSearch() async {
+        await backendReady()
         await apiStore.logSearchEvent()
     }
 
     /// Per-field comparison stats for the patient form (nil for viewers/errors).
     func fetchFieldStats(lat: Double?, lng: Double?) async -> FieldStatsBundle? {
-        await apiStore.fetchFieldStats(lat: lat, lng: lng)
+        await backendReady()
+        return await apiStore.fetchFieldStats(lat: lat, lng: lng)
     }
 }

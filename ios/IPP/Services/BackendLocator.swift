@@ -8,20 +8,44 @@ import Foundation
 /// answers; `AppEnvironment.resolveBackend()` then points every client at it,
 /// so login, patients, field stats, the schema and the leaderboard all follow.
 ///
-/// Two LAN addresses are tried because the host Mac has two interfaces on the
-/// same `/24` — Ethernet `192.168.100.15` (`en10`) and Wi-Fi `192.168.100.11`
-/// (`en0`) — and only the phone can say which one its subnet reaches.
+/// The candidate hosts live in `Info.plist` under ``candidatesInfoKey``, next
+/// to `BackendURL` and `WebURL` — **not** in this file (question Q7). A demo
+/// Mac usually offers more than one address for the same server (an Ethernet
+/// and a Wi-Fi interface on the same `/24`, say), and only the phone can say
+/// which one its subnet actually reaches, so the list is ordered and tried in
+/// turn. Pointing the app at a different machine is a plist edit, not a source
+/// edit, and an empty or missing list simply means "only use `BackendURL`".
 ///
 /// Everything about *which* URLs are tried and *in what order* is a pure
-/// function (``candidates(configured:isSimulator:)``) so it is unit-tested
+/// function (``candidates(configured:isSimulator:lan:)``) so it is unit-tested
 /// off-device; only ``probe(_:timeout:session:)`` touches the network.
 enum BackendLocator {
 
-    /// The owner's two host addresses, in the order the phone should try them.
-    static let lanCandidates: [URL] = [
-        URL(string: "http://192.168.100.15:3334")!,
-        URL(string: "http://192.168.100.11:3334")!,
-    ]
+    /// `Info.plist` key holding the ordered array of candidate base URLs.
+    static let candidatesInfoKey = "BackendCandidates"
+
+    /// Turns the raw `Info.plist` value into URLs, ignoring anything unusable.
+    ///
+    /// Pure, so a malformed plist is a test case rather than a crash: a missing
+    /// key, a wrong type, an empty array and junk strings all degrade to "no
+    /// candidates", which just leaves the configured `BackendURL` in charge.
+    static func parseCandidates(_ raw: Any?) -> [URL] {
+        guard let strings = raw as? [String] else { return [] }
+        return strings.compactMap { string in
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let url = URL(string: trimmed),
+                  url.scheme != nil,
+                  url.host != nil
+            else { return nil }
+            return url
+        }
+    }
+
+    /// The candidate hosts this build was configured with, in order.
+    static var lanCandidates: [URL] {
+        parseCandidates(Bundle.main.object(forInfoDictionaryKey: candidatesInfoKey))
+    }
 
     /// How long a single `/health` request may take before the next candidate
     /// is tried. Short: on a LAN a live host answers in single-digit
@@ -53,14 +77,21 @@ enum BackendLocator {
     /// - A configured URL that is *not* loopback is someone deliberately
     ///   pointing the app somewhere, so it is tried first and the LAN addresses
     ///   become the fallback.
-    static func candidates(configured: URL, isSimulator: Bool) -> [URL] {
+    ///
+    /// `lan` defaults to the `Info.plist` list; it is a parameter only so the
+    /// ordering can be tested against a fixed list.
+    static func candidates(
+        configured: URL,
+        isSimulator: Bool,
+        lan: [URL] = BackendLocator.lanCandidates
+    ) -> [URL] {
         let ordered: [URL]
         if isSimulator {
             ordered = [configured]
         } else if isLoopback(configured) {
-            ordered = lanCandidates + [configured]
+            ordered = lan + [configured]
         } else {
-            ordered = [configured] + lanCandidates
+            ordered = [configured] + lan
         }
 
         var seen = Set<String>()

@@ -255,6 +255,9 @@ struct PatientFormView: View {
         verifyResult = nil
         defer { verifying = false }
         do {
+            // Straight to the client, so the wait for the launch probe has to
+            // be explicit here (question Q8).
+            await env.backendReady()
             verifyResult = try await env.effectStream.verify(rut: patient.rut)
         } catch {
             verifyError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
