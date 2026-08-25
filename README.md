@@ -2,19 +2,24 @@
 
 IPP is a location-based, on-chain-verifiable clinical-records app for Chilean
 doctors and medical staff (Spanish UI). It is built as a **prototype /
-demonstrator** of a reusable template - GPS + location-based AR capture on iOS,
-backed by a Bun service on Neon Postgres, with each record's hash anchored to
+demonstrator** of a reusable template - GPS + AR on iOS (location-based AR at
+capture, plus a camera-based ARKit/RealityKit scene), backed by a Bun service on
+Neon Postgres, with each record's hash anchored to
 **Cardano** (through the **EffectStream** packages) so the data
 can be cryptographically verified later.
 
 The app pairs **GPS** (where each patient lives) with **location-based AR**
-(live population context augmenting what the clinician sees as they work) and a
+(live population context augmenting what the clinician sees as they work),
+**camera-based AR** (an ARKit/RealityKit scene that anchors a podium to the real
+world and renders the geolocated records as a living data map on the floor -
+see [Tiro al Trofeo](#tiro-al-trofeo---camera-based-ar-mini-game)) and a
 **gamified** contribution layer that makes the dataset grow.
 
 ## What this is
 
 - **An iOS app** (SwiftUI) for capturing a ~70-question women's-health intake
-  form across four sections.
+  form across four sections, plus a camera-based AR mini-game on the
+  leaderboard (ARKit/RealityKit).
 - **A web dashboard** (Vite + React + Leaflet) for population maps, filters,
   feedback, and on-chain verification - also embedded inside the iOS app.
 - **A Bun + Fastify backend** on Neon Postgres, with a swappable chain adapter.
@@ -27,7 +32,7 @@ The app pairs **GPS** (where each patient lives) with **location-based AR**
 GPS is the backbone: every patient has an address that geocodes to a
 latitude/longitude. That location unlocks **augmented reality anchored to
 place** - augmenting what the clinician sees about the physical world in front
-of them, in two places:
+of them, in three places:
 
 1. **At capture.** As you enter a value, the field shows the population context
    for it - the **local** (the patient's own locality), **país** (country), and
@@ -36,11 +41,17 @@ of them, in two places:
 2. **On the map.** Doctors draw **notes and named areas** over the filtered
    population layer, turning patterns into plans - e.g. *"many patients in this
    zone need X, assign a specialist and schedule exams here."*
+3. **Through the camera.** The
+   [Tiro al Trofeo](#tiro-al-trofeo---camera-based-ar-mini-game) scene uses
+   ARKit/RealityKit world tracking to anchor a virtual podium onto the real
+   surface in front of the user and projects the anonymized record locations as
+   a living data map on the actual floor around it.
 
-> This is **location-based AR**: the augmentation is anchored to physical place
-> through GPS rather than to a camera feed. The reality being augmented is the
-> clinician's view of the patient and population in front of them, keyed to
-> where the patient actually lives.
+> The first two are **location-based AR** - the augmentation is anchored to
+> physical place through GPS rather than to a camera feed, and the reality being
+> augmented is the clinician's view of the patient and population in front of
+> them, keyed to where the patient actually lives. The third is **camera-based
+> AR** consuming the same GPS data through the phone's camera.
 
 **Why we prioritized it:** women's-health and pelvic-floor risk cluster
 geographically. Location-aware context at the point of capture (and on the map)
@@ -159,8 +170,8 @@ already draws in gold/silver/bronze
 ([ios/IPP/Game/](ios/IPP/Game/), opened from
 [LeaderboardView.swift](ios/IPP/Views/LeaderboardView.swift)).
 
-> **Screenshot / GIF placeholder** - a short capture of a round (place the
-> podium → flick → make → summary) will be added here.
+> **Video:** <https://www.youtube.com/watch?v=7qFVhvGDVyk> - a full round on
+> device: place the podium → flick → make → summary.
 
 - **Place it.** Scan a desk or the floor, tap a detected horizontal plane, and a
   procedural podium appears - three steps in the leaderboard's exact medal
@@ -431,7 +442,11 @@ deterministically from the account seed, sending `X-IPP-PubKey` /
 
 ## Demo - video & screenshots
 
-> A screen recording of the end-to-end flow (capture → location-based AR stats → save →
+> **Camera-AR demo (published):** <https://www.youtube.com/watch?v=7qFVhvGDVyk> -
+> a single on-device take: leaderboard → Jugar → plane detection → podium
+> anchored on the real table → floor data map → physics toss gameplay.
+>
+> A screen recording of the end-to-end clinical flow (capture → location-based AR stats → save →
 > on-chain verify → population map → gamified leaderboard) and screenshots will
 > be added here / in the [EffectStream blog post](https://effectstream.github.io/docs/blog/ipp-clinical-records-cardano).
 
