@@ -53,6 +53,9 @@ struct PatientListView: View {
     }
 
     private func refresh() async {
+        // Straight to the store, so the wait for the launch probe has to be
+        // explicit here (question Q8).
+        await env.backendReady()
         if let list = try? await env.store.list() {
             patients = list
         }

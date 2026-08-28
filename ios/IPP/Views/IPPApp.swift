@@ -13,6 +13,10 @@ struct IPPApp: App {
                 .tint(.ippTeal)
                 .preferredColorScheme(.light)
                 .task {
+                    // Find the backend before anything asks it a question: on
+                    // device the bundled localhost URL is nobody, and the LAN
+                    // host has to be discovered first (Phase 5C).
+                    await env.resolveBackend()
                     await env.schemaService.refresh()
                 }
         }

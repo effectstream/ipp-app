@@ -22,6 +22,10 @@
     <string>1</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>IPP usa la cámara únicamente en el mini-juego de realidad aumentada "Tiro al Trofeo", para detectar una superficie y colocar el podio sobre ella. No se graban ni se envían imágenes.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>IPP busca el servidor de la clínica en tu red local (Wi-Fi) para cargar y guardar las fichas, el ranking y el mapa de ubicaciones. No se contacta ningún servicio externo.</string>
     <key>UILaunchScreen</key>
     <dict/>
     <key>UISupportedInterfaceOrientations</key>
@@ -30,6 +34,14 @@
     </array>
     <key>BackendURL</key>
     <string>http://localhost:3334</string>
+    <!-- Hosts the app asks for /health at launch, in order, before falling back
+         to BackendURL. Edit this list (not Swift source) to point a phone at
+         your own Mac; leave it empty and the app only ever uses BackendURL. -->
+    <key>BackendCandidates</key>
+    <array>
+        <string>http://192.168.100.15:3334</string>
+        <string>http://192.168.100.11:3334</string>
+    </array>
     <key>WebURL</key>
     <string>http://localhost:5174</string>
     <key>NSAppTransportSecurity</key>

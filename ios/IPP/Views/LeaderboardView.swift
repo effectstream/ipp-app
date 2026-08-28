@@ -8,6 +8,19 @@ struct LeaderboardView: View {
     @State private var entries: [LeaderboardEntry] = []
     @State private var loading = true
     @State private var error: String?
+    @State private var showingGame = false
+    /// Locations for the mini-game's floor map (FR-013).
+    ///
+    /// Fetched **here**, at the app layer, and handed to the game as plain
+    /// coordinates so that nothing under `ios/IPP/Game/` performs a request
+    /// (FR-008, question Q5). Starts as the offline sample, so opening the game
+    /// before the fetch lands shows a map rather than an empty plate.
+    @State private var floorMap = FloorMapData(pins: SyntheticMapPins.pins(), isLive: false)
+
+    /// The AR mini-game only runs where ARKit world tracking does — elsewhere
+    /// (Simulator, unsupported hardware) the entry point stays disabled with an
+    /// explanation (FR-001). Reading this never touches the camera.
+    private var gameAvailable: Bool { ARSupport.isWorldTrackingSupported }
 
     var body: some View {
         NavigationStack {
@@ -24,6 +37,14 @@ struct LeaderboardView: View {
                             .font(.callout)
                             .foregroundStyle(Color.ippBody)
                     }
+                }
+
+                Section {
+                    gameRow
+                } footer: {
+                    Text(gameAvailable
+                         ? "Mini-juego de realidad aumentada. Es solo por diversión: no cambia tus puntos."
+                         : ARSupport.unsupportedMessage)
                 }
 
                 Section {
@@ -63,7 +84,45 @@ struct LeaderboardView: View {
                 }
             }
             .task { await load() }
+            .task { await loadFloorMap() }
+            .fullScreenCover(isPresented: $showingGame) {
+                TrophyTossView(floorMap: floorMap)
+            }
         }
+    }
+
+    private var gameRow: some View {
+        Button {
+            showingGame = true
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(gameAvailable ? Color.ippGoldSoft : Color(.tertiarySystemFill))
+                        .frame(width: 36, height: 36)
+                    Image(systemName: "trophy.fill")
+                        .font(.title3)
+                        .foregroundStyle(gameAvailable ? Color.ippGold : Color.ippMuted)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Jugar")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(gameAvailable ? Color.ippInk : Color.ippMuted)
+                    Text("Tiro al Trofeo · encesta en el podio")
+                        .font(.caption)
+                        .foregroundStyle(Color.ippMuted)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.ippFaint)
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!gameAvailable)
+        .opacity(gameAvailable ? 1 : 0.55)
     }
 
     private func heroCard(username: String) -> some View {
@@ -105,6 +164,20 @@ struct LeaderboardView: View {
             self.error = error.localizedDescription
         }
         loading = false
+    }
+
+    /// Reads the anonymized map pins for the mini-game's floor map.
+    ///
+    /// Best-effort and silent: when the backend does not answer, `resolve`
+    /// substitutes the offline sample and the map's own caption says so. Only
+    /// runs where the game can run, so a device that will never show the map
+    /// never makes the request.
+    private func loadFloorMap() async {
+        guard gameAvailable else { return }
+        floorMap = MapPinsService.resolve(
+            fetched: await env.fetchMapPins(),
+            fallback: SyntheticMapPins.pins()
+        )
     }
 }
 
